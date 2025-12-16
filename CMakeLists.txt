@@ -156,7 +156,7 @@ include_directories(
 ## With catkin_make all packages are built within a single CMake context
 ## The recommended prefix ensures that target names across packages don't collide
 # add_executable(${PROJECT_NAME}_node src/fuims_node.cpp)
-add_executable(fuims_final src/fuims_vio.cpp)
+add_executable(fuims_final src/fuims_vio_v2.cpp)
 add_executable(bag_updater src/rosbag_correction.cpp)
 
 ## Rename C++ executable without prefix
