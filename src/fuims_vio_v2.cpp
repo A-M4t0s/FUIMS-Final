@@ -198,6 +198,7 @@ public:
 
         bool firstFrame = true;
         int frameIdx = 0;
+        ros::WallTime start = ros::WallTime::now();
         // =========================================================
         // Main Loop - Processing each frame
         // =========================================================
@@ -209,10 +210,14 @@ public:
             if (!imgMsg)
                 continue;
 
+            // =========================================================
             // Undistorting Image
+            // =========================================================
             undistortImage(imgMsg);
 
+            // =========================================================
             // If first frame, just detect features
+            // =========================================================
             if (firstFrame)
             {
                 featureDetection(currUndistortedGrey);
@@ -222,7 +227,9 @@ public:
                 continue;
             }
 
+            // =========================================================
             // Verifiying we have previous points to track
+            // =========================================================
             if (prevPoints.pts.size() < 25) // At least 25 points to track
             {
                 ROS_WARN("No previous points to track, detecting new features");
@@ -232,7 +239,9 @@ public:
                 continue;
             }
 
+            // =========================================================
             // Feature Tracking (KLT)
+            // =========================================================
             std::vector<cv::Point2f> trackedPoints;
             std::vector<uchar> status;
             std::vector<float> error;
@@ -247,7 +256,9 @@ public:
                 cv::Size(21, 21),
                 2);
 
+            // =========================================================
             // Build filtered correspondences
+            // =========================================================
             Points currFiltered;
             std::vector<cv::Point2f> prevValid, currValid;
 
@@ -282,21 +293,19 @@ public:
 
             currPoints = currFiltered;
 
+            // =========================================================
             // If number of tracked points below threshold, detect new features
+            // =========================================================
             if (currPoints.pts.size() < KF_FEATURE_THRESHOLD)
             {
-                Points trackedBackup = currPoints;
-                featureDetection(currUndistortedGrey);
-
-                currPoints.pts.insert(currPoints.pts.end(),
-                                      trackedBackup.pts.begin(),
-                                      trackedBackup.pts.end());
-                currPoints.ids.insert(currPoints.ids.end(),
-                                      trackedBackup.ids.begin(),
-                                      trackedBackup.ids.end());
+                ROS_INFO("[Frame %d] Replenishing features. Current count: %zu",
+                         frameIdx, currPoints.pts.size());
+                replenishFeatures(currUndistortedGrey);
             }
 
+            // =========================================================
             // Debug Image Publishing
+            // =========================================================
             cv::Mat prevBgr, currBgr;
             cv::cvtColor(prevUndistortedGrey, prevBgr, cv::COLOR_GRAY2BGR);
             cv::cvtColor(currUndistortedGrey, currBgr, cv::COLOR_GRAY2BGR);
@@ -322,10 +331,17 @@ public:
             debugMsg->header.stamp = m.getTime();
             debugPub.publish(debugMsg);
 
+            // =========================================================
             // Preparing for next iteration
+            // =========================================================
             prevUndistortedGrey = currUndistortedGrey.clone();
             prevPoints = currPoints;
         }
+
+        ROS_INFO("VIO Processing Complete.");
+        ros::WallTime finish = ros::WallTime::now();
+        ROS_INFO("Total Processing Time: %.2f seconds", (finish - start).toSec());
+        bag.close();
     }
 
 private:
@@ -427,7 +443,66 @@ private:
         }
     }
 
-    // Method for Visualizing Feature Matching Debug Images
+    // Method for Replenishing Tracked Features
+    void replenishFeatures(const cv::Mat &img)
+    {
+        // Calculating number of features to detect
+        int nToDetect = ORB_N_BEST - static_cast<int>(currPoints.pts.size());
+        if (nToDetect <= 0)
+            return;
+
+        // Mask Creation
+        // Used to mask the existing features
+        cv::Mat mask(img.size(), CV_8UC1, cv::Scalar(255));
+        int radius = 21;
+
+        // Masking existing features
+        for (const auto &p : currPoints.pts)
+        {
+            int x = cvRound(p.x), y = cvRound(p.y);
+            if (p.x >= 0 && p.x < img.cols && p.y >= 0 && p.y < img.rows)
+                cv::circle(mask, p, radius, cv::Scalar(0), -1);
+        }
+
+        // Variable Declaration for Feature Detection
+        std::vector<cv::KeyPoint> kpNew;
+
+        // ORB Keypoint Detection
+        orb->detect(img, kpNew, mask);
+
+        // Ordering Keypoints by Response
+        std::vector<int> idx(kpNew.size());
+        std::iota(idx.begin(), idx.end(), 0);
+        std::sort(idx.begin(), idx.end(),
+                  [&](int a, int b)
+                  { return kpNew[a].response > kpNew[b].response; });
+
+        // Selecting the required number of keypoints
+        int added = 0;
+        for (int j : idx)
+        {
+            if (added >= nToDetect)
+                break;
+
+            const cv::Point2f p = kpNew[j].pt;
+            int x = cvRound(p.x), y = cvRound(p.y);
+
+            if (x < 0 || x >= img.cols || y < 0 || y >= img.rows)
+                continue;
+
+            // still free?
+            if (mask.at<uint8_t>(y, x) == 0)
+                continue;
+
+            currPoints.pts.push_back(p);
+            currPoints.ids.push_back(nextFeatureID++);
+
+            // block area so new points don't cluster
+            cv::circle(mask, cv::Point(x, y), radius, cv::Scalar(0), -1);
+
+            added++;
+        }
+    }
 };
 
 /*
