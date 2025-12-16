@@ -38,6 +38,8 @@
 #include <opencv2/video.hpp>
 #include <opencv2/viz.hpp>
 
+#include <signal.h>
+
 #define BAG_PATH "/home/tony/catkin_ws/bags/bags_fuims/agucadoura.bag"
 #define CAMERA_TOPIC "/dji_m350/cameras/main/compressed"
 #define QUATERNION_TOPIC "/dji_m350/quaternion"
@@ -117,6 +119,22 @@ ENU ecefToENU(double X, double Y, double Z,
 
 /*
  * ================================================================================================================
+ * Signal Handling
+ * ================================================================================================================
+ */
+volatile sig_atomic_t g_requestShutdown = 0;
+
+void signalHandler(int sig)
+{
+    if (sig == SIGINT)
+    {
+        g_requestShutdown = 1;
+        ROS_WARN("SIGINT received. Shutting down VIO.");
+    }
+}
+
+/*
+ * ================================================================================================================
  * Class: vioManager
  * ================================================================================================================
  */
@@ -125,6 +143,11 @@ class vioManager
 public:
     vioManager()
     {
+        // =========================================================
+        // Signal Handling
+        // =========================================================
+        signal(SIGINT, signalHandler);
+
         // =========================================================
         // Starting Publishers
         // =========================================================
@@ -204,6 +227,12 @@ public:
         // =========================================================
         for (const rosbag::MessageInstance &m : cam_view)
         {
+            if (g_requestShutdown)
+            {
+                ROS_WARN("Shutdown requested. Breaking processing loop.");
+                break;
+            }
+            
             ROS_INFO("Processing frame %d", frameIdx++);
 
             auto imgMsg = m.instantiate<sensor_msgs::CompressedImage>();
@@ -298,9 +327,10 @@ public:
             // =========================================================
             if (currPoints.pts.size() < KF_FEATURE_THRESHOLD)
             {
-                ROS_INFO("[Frame %d] Replenishing features. Current count: %zu",
+                ROS_WARN("[Frame %d] Replenishing features. Current count: %zu",
                          frameIdx, currPoints.pts.size());
                 replenishFeatures(currUndistortedGrey);
+                ROS_INFO("New feature count: %zu", currPoints.pts.size());
             }
 
             // =========================================================
