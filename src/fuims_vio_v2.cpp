@@ -18,6 +18,7 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <Eigen/Dense>
 
 #include <gtsam/linear/NoiseModel.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
@@ -220,6 +221,7 @@ public:
         values.insert(gtsam::Symbol('x', 0), prior);
 
         bool firstFrame = true;
+        bool hasTracking = true;
         int frameIdx = 0;
         ros::WallTime start = ros::WallTime::now();
         // =========================================================
@@ -232,7 +234,7 @@ public:
                 ROS_WARN("Shutdown requested. Breaking processing loop.");
                 break;
             }
-            
+
             ROS_INFO("Processing frame %d", frameIdx++);
 
             auto imgMsg = m.instantiate<sensor_msgs::CompressedImage>();
@@ -265,6 +267,7 @@ public:
                 featureDetection(currUndistortedGrey);
                 prevPoints = currPoints;
                 prevUndistortedGrey = currUndistortedGrey.clone();
+                hasTracking = false;
                 continue;
             }
 
@@ -331,6 +334,15 @@ public:
                          frameIdx, currPoints.pts.size());
                 replenishFeatures(currUndistortedGrey);
                 ROS_INFO("New feature count: %zu", currPoints.pts.size());
+            }
+
+            // =========================================================
+            // Relative Movement Estimation
+            // =========================================================
+            if (hasTracking && prevValid.size() >= 15)
+            {
+                gtsam::Pose3 deltaPose =
+                    relativeMovementEstimation(prevValid, currValid);
             }
 
             // =========================================================
@@ -412,6 +424,9 @@ private:
     gtsam::NonlinearFactorGraph graph;
     gtsam::noiseModel::Diagonal::shared_ptr noise;
     gtsam::Values values;
+
+    // Relative Pose variables
+    cv::Mat R, t;
 
     /*
      * ================================================================================================================
@@ -532,6 +547,53 @@ private:
 
             added++;
         }
+    }
+
+    // Method for estimating relative movement between frames
+    gtsam::Pose3 relativeMovementEstimation(
+        std::vector<cv::Point2f> &prevValid,
+        std::vector<cv::Point2f> &currValid)
+    {
+        // Must have a minimum number of detected points
+        if (prevValid.size() < 8 || currValid.size() < 8)
+        {
+            ROS_WARN("[relativeMovementEstimation] Not enough features");
+            return gtsam::Pose3(); // Identity Matrix
+        }
+
+        // Determining Essential Matrix
+        cv::Mat E = cv::findEssentialMat(
+            prevPoints.pts,
+            currPoints.pts,
+            K,
+            cv::RANSAC,
+            0.999,
+            1.0);
+
+        if (E.empty())
+        {
+            ROS_WARN("[relativeMovementEstimation] Essential Matrix not valid");
+            return gtsam::Pose3();
+        }
+
+        // Recover pose
+        cv::Mat R, t;
+        cv::recoverPose(E, currValid, prevValid, K, R, t);
+
+        // OpenCV to GTSAM
+        Eigen::Matrix3d Rg_mat;
+        Rg_mat << R.at<double>(0, 0), R.at<double>(0, 1), R.at<double>(0, 2),
+            R.at<double>(1, 0), R.at<double>(1, 1), R.at<double>(1, 2),
+            R.at<double>(2, 0), R.at<double>(2, 1), R.at<double>(2, 2);
+
+        gtsam::Rot3 Rg(Rg_mat);
+
+        gtsam::Point3 tg(
+            t.at<double>(0),
+            t.at<double>(1),
+            t.at<double>(2));
+
+        return gtsam::Pose3(Rg, tg);
     }
 };
 
