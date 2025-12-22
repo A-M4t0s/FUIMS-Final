@@ -222,7 +222,9 @@ public:
 
         bool firstFrame = true;
         bool hasTracking = true;
+        bool trackingReset = false;
         int frameIdx = 0;
+        int lastKeyframeIdx = 0;
         ros::WallTime start = ros::WallTime::now();
         // =========================================================
         // Main Loop - Processing each frame
@@ -268,6 +270,7 @@ public:
                 prevPoints = currPoints;
                 prevUndistortedGrey = currUndistortedGrey.clone();
                 hasTracking = false;
+                trackingReset = true;
                 continue;
             }
 
@@ -337,12 +340,117 @@ public:
             }
 
             // =========================================================
-            // Relative Movement Estimation
+            // Keyframe Decision
             // =========================================================
-            if (hasTracking && prevValid.size() >= 15)
+            bool isKeyframe = false;
+
+            // First Keyframe
+            if (trackingReset)
             {
+                isKeyframe = false;
+            }
+            else if (!hasKF)
+            {
+                isKeyframe = true;
+            }
+            else
+            {
+                // Criteria 1 - Parallax related to last keyframe
+                double kfParallax = computeKFParallax(lastKF, currPoints);
+                ROS_INFO("KF Parallax = %.2f", kfParallax);
+
+                if (kfParallax > KF_PARALLAX_THRESHOLD)
+                    isKeyframe = true;
+
+                // Criteria 2 - Tracking Quality
+                if (currPoints.pts.size() < KF_FEATURE_THRESHOLD)
+                    isKeyframe = true;
+            }
+
+            // =========================================================
+            // Handle new keyframe
+            // =========================================================
+            if (isKeyframe)
+            {
+                ROS_WARN("=== New Keyframe at frame %d ===", frameIdx);
+
+                // =========================================================
+                // First keyframe initialization
+                // =========================================================
+                if (!hasKF)
+                {
+                    lastKF.frameID = frameIdx;
+                    lastKF.greyImg = currUndistortedGrey.clone();
+                    lastKF.points = currPoints;
+
+                    hasKF = true;
+                    lastKeyframeIdx = frameIdx;
+                    continue;
+                }
+
+                // =========================================================
+                // Establishing KF correspondences
+                // =========================================================
+                std::vector<cv::Point2f> kfPts, currPts;
+
+                for (size_t i = 0; i < lastKF.points.ids.size(); i++)
+                {
+                    int idKF = lastKF.points.ids[i];
+
+                    auto it = std::find(
+                        currPoints.ids.begin(),
+                        currPoints.ids.end(),
+                        idKF);
+
+                    if (it == currPoints.ids.end())
+                        continue;
+
+                    int j = std::distance(currPoints.ids.begin(), it);
+
+                    kfPts.push_back(lastKF.points.pts[i]);
+                    currPts.push_back(currPoints.pts[j]);
+                }
+
+                if (kfPts.size() < 15)
+                {
+                    ROS_WARN("Not enough KF correspondences (%zu)", kfPts.size());
+                    continue;
+                }
+
+                // =========================================================
+                // Relative Movement Estimation (KF -> current)
+                // =========================================================
                 gtsam::Pose3 deltaPose =
-                    relativeMovementEstimation(prevValid, currValid);
+                    relativeMovementEstimation(kfPts, currPts);
+
+                // =========================================================
+                // Adding factor to GTSAM graph
+                // =========================================================
+                graph.add(
+                    gtsam::BetweenFactor<gtsam::Pose3>(
+                        gtsam::Symbol('x', lastKeyframeIdx),
+                        gtsam::Symbol('x', frameIdx),
+                        deltaPose,
+                        noise));
+
+                // =========================================================
+                // Initial value propagation
+                // =========================================================
+                gtsam::Pose3 prevPose =
+                    values.at<gtsam::Pose3>(gtsam::Symbol('x', lastKeyframeIdx));
+
+                values.insert(
+                    gtsam::Symbol('x', frameIdx),
+                    prevPose.compose(deltaPose));
+
+                // =========================================================
+                // Updating last keyframe
+                // =========================================================
+                lastKF.frameID = frameIdx;
+                lastKF.greyImg = currUndistortedGrey.clone();
+                lastKF.points = currPoints;
+
+                lastKeyframeIdx = frameIdx;
             }
 
             // =========================================================
@@ -378,6 +486,8 @@ public:
             // =========================================================
             prevUndistortedGrey = currUndistortedGrey.clone();
             prevPoints = currPoints;
+            trackingReset = false;
+            hasTracking = true;
         }
 
         ROS_INFO("VIO Processing Complete.");
@@ -415,6 +525,10 @@ private:
     // Images
     cv::Mat currUndistortedGrey, currUndistortedRGB;
     cv::Mat prevUndistortedGrey, prevUndistortedRGB;
+
+    // Keyframes
+    Keyframe lastKF;
+    bool hasKF = false;
 
     // Feature Points
     Points currPoints, prevPoints;
@@ -563,8 +677,8 @@ private:
 
         // Determining Essential Matrix
         cv::Mat E = cv::findEssentialMat(
-            prevPoints.pts,
-            currPoints.pts,
+            prevValid,
+            currValid,
             K,
             cv::RANSAC,
             0.999,
@@ -594,6 +708,52 @@ private:
             t.at<double>(2));
 
         return gtsam::Pose3(Rg, tg);
+    }
+
+    // Method for computing parallax
+    double computeParallax(
+        const std::vector<cv::Point2f> &prevValid,
+        const std::vector<cv::Point2f> &currValid)
+    {
+        if (prevValid.empty())
+            return 0.0;
+
+        double sum = 0.0;
+        for (size_t i = 0; i < prevValid.size(); i++)
+            sum += cv::norm(currValid[i] - prevValid[i]);
+
+        return sum / prevValid.size();
+    }
+
+    double computeKFParallax(
+        Keyframe &KF,
+        Points &currPts)
+    {
+        double sum = 0.0;
+        int cnt = 0;
+
+        // Calculating parallax
+        for (size_t i = 0; i < KF.points.ids.size(); i++)
+        {
+            int idKF = KF.points.ids[i];
+
+            auto it = std::find(currPts.ids.begin(), currPts.ids.end(), idKF);
+            if (it == currPts.ids.end())
+                continue;
+
+            int j = std::distance(currPts.ids.begin(), it);
+
+            double dx = currPts.pts[j].x - KF.points.pts[i].x;
+            double dy = currPts.pts[j].y - KF.points.pts[i].y;
+
+            sum += std::sqrt(dx * dx + dy * dy);
+            cnt++;
+        }
+
+        if (cnt == 0)
+            return 0.0;
+
+        return sum / cnt;
     }
 };
 
