@@ -222,7 +222,6 @@ public:
 
         bool firstFrame = true;
         bool hasTracking = true;
-        bool trackingReset = false;
         int frameIdx = 0;
         int lastKeyframeIdx = 0;
         ros::WallTime start = ros::WallTime::now();
@@ -270,7 +269,6 @@ public:
                 prevPoints = currPoints;
                 prevUndistortedGrey = currUndistortedGrey.clone();
                 hasTracking = false;
-                trackingReset = true;
                 continue;
             }
 
@@ -345,11 +343,7 @@ public:
             bool isKeyframe = false;
 
             // First Keyframe
-            if (trackingReset)
-            {
-                isKeyframe = false;
-            }
-            else if (!hasKF)
+            if (!hasKF)
             {
                 isKeyframe = true;
             }
@@ -374,83 +368,16 @@ public:
             {
                 ROS_WARN("=== New Keyframe at frame %d ===", frameIdx);
 
-                // =========================================================
-                // First keyframe initialization
-                // =========================================================
-                if (!hasKF)
-                {
-                    lastKF.frameID = frameIdx;
-                    lastKF.greyImg = currUndistortedGrey.clone();
-                    lastKF.points = currPoints;
-
-                    hasKF = true;
-                    lastKeyframeIdx = frameIdx;
-                    continue;
-                }
-
-                // =========================================================
-                // Establishing KF correspondences
-                // =========================================================
-                std::vector<cv::Point2f> kfPts, currPts;
-
-                for (size_t i = 0; i < lastKF.points.ids.size(); i++)
-                {
-                    int idKF = lastKF.points.ids[i];
-
-                    auto it = std::find(
-                        currPoints.ids.begin(),
-                        currPoints.ids.end(),
-                        idKF);
-
-                    if (it == currPoints.ids.end())
-                        continue;
-
-                    int j = std::distance(currPoints.ids.begin(), it);
-
-                    kfPts.push_back(lastKF.points.pts[i]);
-                    currPts.push_back(currPoints.pts[j]);
-                }
-
-                if (kfPts.size() < 15)
-                {
-                    ROS_WARN("Not enough KF correspondences (%zu)", kfPts.size());
-                    continue;
-                }
-
-                // =========================================================
-                // Relative Movement Estimation (KF -> current)
-                // =========================================================
-                gtsam::Pose3 deltaPose =
-                    relativeMovementEstimation(kfPts, currPts);
-
-                // =========================================================
-                // Adding factor to GTSAM graph
-                // =========================================================
-                graph.add(
-                    gtsam::BetweenFactor<gtsam::Pose3>(
-                        gtsam::Symbol('x', lastKeyframeIdx),
-                        gtsam::Symbol('x', frameIdx),
-                        deltaPose,
-                        noise));
-
-                // =========================================================
-                // Initial value propagation
-                // =========================================================
-                gtsam::Pose3 prevPose =
-                    values.at<gtsam::Pose3>(gtsam::Symbol('x', lastKeyframeIdx));
-
-                values.insert(
-                    gtsam::Symbol('x', frameIdx),
-                    prevPose.compose(deltaPose));
-
-                // =========================================================
-                // Updating last keyframe
-                // =========================================================
                 lastKF.frameID = frameIdx;
                 lastKF.greyImg = currUndistortedGrey.clone();
                 lastKF.points = currPoints;
 
+                hasKF = true;
                 lastKeyframeIdx = frameIdx;
+
+                // =========================================================
+                // Relative Movement Estimation
+                // =========================================================
             }
 
             // =========================================================
@@ -486,7 +413,6 @@ public:
             // =========================================================
             prevUndistortedGrey = currUndistortedGrey.clone();
             prevPoints = currPoints;
-            trackingReset = false;
             hasTracking = true;
         }
 
@@ -677,8 +603,8 @@ private:
 
         // Determining Essential Matrix
         cv::Mat E = cv::findEssentialMat(
-            prevValid,
-            currValid,
+            prevPoints.pts,
+            currPoints.pts,
             K,
             cv::RANSAC,
             0.999,
