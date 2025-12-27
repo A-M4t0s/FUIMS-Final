@@ -345,7 +345,6 @@ public:
             // First Keyframe
             if (!hasKF)
             {
-                kfIndex = 0;
                 isKeyframe = true;
             }
             else
@@ -355,15 +354,11 @@ public:
                 ROS_INFO("KF Parallax = %.2f", kfParallax);
 
                 if (kfParallax > KF_PARALLAX_THRESHOLD)
-                {
                     isKeyframe = true;
-                }
 
                 // Criteria 2 - Tracking Quality
                 if (currPoints.pts.size() < KF_FEATURE_THRESHOLD)
-                {
                     isKeyframe = true;
-                }
             }
 
             // =========================================================
@@ -373,52 +368,17 @@ public:
             {
                 ROS_WARN("=== New Keyframe at frame %d ===", frameIdx);
 
-                if (!hasKF)
-                {
-                    // Primeiro KF: só inicializa
-                    kfIndex = 0;
-                }
-                else
-                {
-                    std::vector<cv::Point2f> kfPts, curPtsFromKF;
-                    buildCorrespondencesById(lastKF.points, currPoints, kfPts, curPtsFromKF);
-                    if (kfPts.size() < 8)
-                    {
-                        ROS_WARN("Not enough KF correspondences (%zu)", kfPts.size());
-                    }
-                    else
-                    {
-                        gtsam::Pose3 T_kf_curr = relativeMovementEstimation(kfPts, curPtsFromKF);
-                        int prevK = kfIndex;
-                        int curK = kfIndex + 1;
-
-                        auto odomNoise = gtsam::noiseModel::Diagonal::Sigmas(
-                            (gtsam::Vector(6) << 0.2, 0.2, 0.2, 0.1, 0.1, 0.1).finished());
-
-                        graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
-                            gtsam::Symbol('x', prevK),
-                            gtsam::Symbol('x', curK),
-                            T_kf_curr,
-                            odomNoise));
-
-                        // inicialização do novo nó (seed)
-                        gtsam::Pose3 seed = values.at<gtsam::Pose3>(gtsam::Symbol('x', prevK)).compose(T_kf_curr);
-                        values.insert(gtsam::Symbol('x', curK), seed);
-
-                        kfIndex++;
-                    }
-                }
-
                 lastKF.frameID = frameIdx;
                 lastKF.greyImg = currUndistortedGrey.clone();
                 lastKF.points = currPoints;
-                lastKeyframeIdx = frameIdx;
-                hasKF = true;
-            }
 
-            // =========================================================
-            // Relative Movement Estimation
-            // =========================================================
+                hasKF = true;
+                lastKeyframeIdx = frameIdx;
+
+                // =========================================================
+                // Relative Movement Estimation
+                // =========================================================
+            }
 
             // =========================================================
             // Debug Image Publishing
@@ -493,8 +453,7 @@ private:
     cv::Mat prevUndistortedGrey, prevUndistortedRGB;
 
     // Keyframes
-    Keyframe lastKF, currKF;
-    int kfIndex = 0;
+    Keyframe lastKF;
     bool hasKF = false;
 
     // Feature Points
@@ -692,7 +651,6 @@ private:
         return sum / prevValid.size();
     }
 
-    // Method for computing parallax
     double computeKFParallax(
         Keyframe &KF,
         Points &currPts)
@@ -722,29 +680,6 @@ private:
             return 0.0;
 
         return sum / cnt;
-    }
-
-    // Method that establishes feature correspondence, using its ID
-    void buildCorrespondencesById(const Points &ref, const Points &cur,
-                                  std::vector<cv::Point2f> &refPts,
-                                  std::vector<cv::Point2f> &curPts)
-    {
-        refPts.clear();
-        curPts.clear();
-        refPts.reserve(ref.ids.size());
-
-        for (size_t i = 0; i < ref.ids.size(); i++)
-        {
-            int id = ref.ids[i];
-            auto it = std::find(cur.ids.begin(), cur.ids.end(), id);
-            if (it == cur.ids.end())
-                continue;
-
-            int j = std::distance(cur.ids.begin(), it);
-
-            refPts.push_back(ref.pts[i]);
-            curPts.push_back(cur.pts[j]);
-        }
     }
 };
 
