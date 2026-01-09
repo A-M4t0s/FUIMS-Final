@@ -2,6 +2,7 @@
 #include <rosbag/bag.h>
 #include <rosbag/view.h>
 
+#include <std_msgs/Float64.h>
 #include <sensor_msgs/CompressedImage.h>
 #include <sensor_msgs/NavSatFix.h>
 #include <geometry_msgs/QuaternionStamped.h>
@@ -14,6 +15,7 @@
 #define QUATERNION_TOPIC "/dji_m350/quaternion"
 #define VELOCITY_TOPIC "/dji_m350/velocity"
 #define GPS_TOPIC "/dji_m350/gps"
+#define ALTITUDE_TOPIC "/dji_m350/altitude"
 
 class rosbagUpdater
 {
@@ -27,6 +29,7 @@ public:
             CAMERA_TOPIC,
             QUATERNION_TOPIC,
             VELOCITY_TOPIC,
+            ALTITUDE_TOPIC,
             GPS_TOPIC};
 
         rosbag::View view(input, rosbag::TopicQuery(topics));
@@ -63,6 +66,16 @@ public:
                 auto v = m.instantiate<geometry_msgs::Vector3Stamped>();
                 if (v)
                     output.write(VELOCITY_TOPIC, t, *v);
+
+                continue;
+            }
+
+            // ALTITUDE
+            if (m.getTopic() == ALTITUDE_TOPIC)
+            {
+                auto alt = m.instantiate<std_msgs::Float64>();
+                if (alt)
+                    output.write(ALTITUDE_TOPIC, t, *alt);
 
                 continue;
             }
