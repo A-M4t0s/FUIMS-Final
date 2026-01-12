@@ -80,8 +80,8 @@ static constexpr int KLT_MAX_LEVEL = 4;
 static constexpr int KLT_ITERS = 30;
 static constexpr double KLT_EPS = 0.01;
 static constexpr double KLT_MIN_EIG = 1e-4;
-static constexpr float FB_THRESH_PX = 1.0f;
-static constexpr int BORDER_MARGIN = 10;
+static constexpr float KLT_FB_THRESH_PX = 1.0f;
+static constexpr int KLT_BORDER_MARGIN = 10;
 
 // GFTT (Shi-Tomasi) Parameters
 static constexpr int GFTT_MAX_FEATURES = 500;

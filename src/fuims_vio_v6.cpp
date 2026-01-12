@@ -10,6 +10,9 @@
 #include <sensor_msgs/CompressedImage.h>
 #include <cv_bridge/cv_bridge.h>
 
+#include <dynamic_reconfigure/server.h>
+#include <fuims/vioParamsConfig.h>
+
 #include <gtsam/linear/NoiseModel.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/Values.h>
@@ -88,13 +91,29 @@ typedef struct
  * @param age Vector of integers indicating the age of each point
  * @return Points structure
  */
-struct Points
+typedef struct
 {
-  std::vector<int> ids;         
+  std::vector<int> ids;
   std::vector<cv::Point2f> pts;
-  std::vector<bool> isTracked; 
-  std::vector<int> age;        
-};
+  std::vector<bool> isTracked;
+  std::vector<int> age;
+} Points;
+
+/**
+ * @brief Keyframe Structure
+ * @param timestamp ROS Time Stamp
+ * @param image Image associated with the keyframe as cv::Mat
+ * @param points Points associated with the keyframe
+ * @param pose Camera Pose as gtsam::Pose3
+ * @return Keyframe structure
+ */
+typedef struct
+{
+  ros::Time timestamp;
+  cv::Mat image;
+  Points points;
+  gtsam::Pose3 pose;
+} Keyframe;
 
 // =========================================================
 // Signal Handling
@@ -124,6 +143,13 @@ public:
     // =========================================================
     // Setting signal 'SIGINT' reception
     signal(SIGINT, signalHandler);
+
+    // Setting ROS Params
+    loadParams();
+
+    // Start dynamic reconfigure server
+    drCallback = boost::bind(&vioManager::configCallback, this, _1, _2);
+    drServer.setCallback(drCallback);
 
     // Initializing ROS Publishers [TODO]
 
@@ -170,7 +196,26 @@ private:
   ros::Subscriber resetSub, imgSub, quatSub, velSub, gpsSub;
   nav_msgs::Path pathMsg;
 
-  // Message Storage
+  // Dynamic Reconfigure
+  dynamic_reconfigure::Server<fuims::vioParamsConfig> drServer;
+  dynamic_reconfigure::Server<fuims::vioParamsConfig>::CallbackType drCallback;
+
+  // Global Variables for ROS Parameters
+  // === General VIO Parameters ===
+  int MAX_FEATURES, MIN_TRACKED_FEATURES, MAX_TRACKING_AGE,
+      KF_FEATURE_THRESHOLD, KF_PARALLAX_THRESHOLD, GPS_PRIOR_INTERVAL;
+  float MAX_TRACKING_ERROR_PX;
+
+  // === GFTT Parameters ===
+  int GFTT_MAX_FEATURES, GFTT_BLOCK_SIZE;
+  double GFTT_QUALITY, GFTT_MIN_DIST;
+
+  // === KLT Parameters ===
+  int KLT_MAX_LEVEL, KLT_ITERS, KLT_BORDER_MARGIN;
+  double KLT_EPS, KLT_MIN_EIG;
+  float KLT_FB_THRESH_PX;
+
+  // ROS Topic Messages Buffers
   std::vector<geometry_msgs::QuaternionStampedConstPtr> quatMsgs;
   std::vector<geometry_msgs::Vector3StampedConstPtr> velMsgs;
   std::vector<sensor_msgs::NavSatFixConstPtr> gpsMsgs;
@@ -186,9 +231,67 @@ private:
   // Status variables
   bool isFirstFrame = true;
 
+  // VO-Related Variables
+  ImageFrame currFrame, prevFrame;
+  Points currPoints, prevPoints;
+  int nextFeatureID = 0;
+
+  // =========================================================
+  // Helpers
+  // =========================================================
+  /**
+   * @brief ROS Parameter Loader
+   * @param void
+   * @return void
+   */
+  void loadParams()
+  {
+    // === General VIO Parameters ===
+    nh.param("MAX_FEATURES", MAX_FEATURES, 250);
+    nh.param("MIN_TRACKED_FEATURES", MIN_TRACKED_FEATURES, 35);
+    nh.param("MAX_TRACKING_ERROR_PX", MAX_TRACKING_ERROR_PX, 7.5f);
+    nh.param("MAX_TRACKING_AGE", MAX_TRACKING_AGE, 5);
+    nh.param("KF_FEATURE_THRESHOLD", KF_FEATURE_THRESHOLD, 75);
+    nh.param("KF_PARALLAX_THRESHOLD", KF_PARALLAX_THRESHOLD, 28);
+    nh.param("GPS_PRIOR_INTERVAL", GPS_PRIOR_INTERVAL, 10);
+
+    // === GFTT Parameters ===
+    nh.param("GFTT_MAX_FEATURES", GFTT_MAX_FEATURES, 500);
+    nh.param("GFTT_BLOCK_SIZE", GFTT_BLOCK_SIZE, 3);
+    nh.param("GFTT_QUALITY", GFTT_QUALITY, 0.15);
+    nh.param("GFTT_MIN_DIST", GFTT_MIN_DIST, 26.0);
+
+    // === KLT Parameters ===
+    nh.param("KLT_MAX_LEVEL", KLT_MAX_LEVEL, 4);
+    nh.param("KLT_ITERS", KLT_ITERS, 30);
+    nh.param("KLT_BORDER_MARGIN", KLT_BORDER_MARGIN, 10);
+    nh.param("KLT_EPS", KLT_EPS, 0.01);
+    nh.param("KLT_MIN_EIG", KLT_MIN_EIG, 1e-4);
+    nh.param("KLT_FB_THRESH_PX", KLT_FB_THRESH_PX, 1.0f);
+  }
+
   // =========================================================
   // Callbacks
   // =========================================================
+  /**
+   * @brief Dynamic Reconfigure Callback
+   * @param config vioParams Configuration
+   * @param level Bit mask indicating modified params
+   * @return void
+   */
+  void configCallback(fuims::vioParamsConfig &config, uint32_t level)
+  {
+    MAX_FEATURES = config.MAX_FEATURES;
+    MIN_TRACKED_FEATURES = config.MIN_TRACKED_FEATURES;
+    MAX_TRACKING_ERROR_PX = config.MAX_TRACKING_ERROR_PX;
+    MAX_TRACKING_AGE = config.MAX_TRACKING_AGE;
+    KF_FEATURE_THRESHOLD = config.KF_FEATURE_THRESHOLD;
+    KF_PARALLAX_THRESHOLD = config.KF_PARALLAX_THRESHOLD;
+    GPS_PRIOR_INTERVAL = config.GPS_PRIOR_INTERVAL;
+
+    INFO("Dynamic reconfigure updated VIO parameters.");
+  }
+
   /**
    * @brief Reset Callback
    * @param msg Bool Message
@@ -199,7 +302,7 @@ private:
    */
   void resetCallback(const std_msgs::BoolConstPtr &msg)
   {
-    if(msg->data)
+    if (msg->data)
     {
       OK("Reset requested. Resetting VIO state.");
       // Reset internal states and variables here
@@ -225,6 +328,8 @@ private:
 
     imgMsgs.push_back(frame);
   }
+
+  // [TODO] -> Callbacks: Quaternion|Velocity|GPS
 
   // =========================================================
   // Methods
@@ -258,6 +363,27 @@ private:
     Points detectedPoints;
 
     // GFTT Detector
+    std::vector<cv::Points2f> features;
+    cv::goodFeaturesToTrack(
+      img,
+      features,
+      MAX_FEATURES,
+      GFTT_QUALITY,
+      GFTT_MIN_DIST,
+      cv::noArray(),
+      GFTT_BLOCK_SIZE,
+      false,
+      0.04
+    );
+
+    // Fill the points structure
+    for(const auto &pt : features)
+    {
+      detectedPoints.pts.push_back(pt);
+      detectedPoints.ids.push_back(nextFeatureID++);
+      detectedPoints.isTracked.push_back(false);
+      detectedPoints.age.push_back(1);
+    }
 
     return detectedPoints;
   }

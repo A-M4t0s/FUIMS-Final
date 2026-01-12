@@ -22,6 +22,7 @@ find_package(catkin REQUIRED COMPONENTS
   cv_bridge
   image_transport
   message_generation
+  dynamic_reconfigure
 )
 
 ## System dependencies are found with CMake's conventions
@@ -104,6 +105,10 @@ generate_messages(
 #   cfg/DynReconf1.cfg
 #   cfg/DynReconf2.cfg
 # )
+generate_dynamic_reconfigure_options(
+  cfg/vioParams.cfg
+)
+
 
 ###################################
 ## catkin specific configuration ##
@@ -128,6 +133,7 @@ catkin_package(
     cv_bridge
     image_transport
     message_runtime
+    dynamic_reconfigure
   DEPENDS OpenCV
 )
 

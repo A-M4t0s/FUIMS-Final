@@ -54,15 +54,18 @@
   <build_depend>roscpp</build_depend>
   <build_depend>message_generation</build_depend>
   <build_depend>rosbag</build_depend>
+  <build_depend>dynamic_reconfigure</build_depend>
   <build_export_depend>gtsam</build_export_depend>
   <build_export_depend>opencv</build_export_depend>
   <build_export_depend>roscpp</build_export_depend>
   <build_export_depend>rosbag</build_export_depend>
+  <build_export_depend>dynamic_reconfigure</build_export_depend>
   <exec_depend>gtsam</exec_depend>
   <exec_depend>opencv</exec_depend>
   <exec_depend>roscpp</exec_depend>
   <exec_depend>rosbag</exec_depend>
   <exec_depend>message_runtime</exec_depend>
+  <exec_depend>dynamic_reconfigure</exec_depend>
 
   <depend>std_msgs</depend> 
   <depend>sensor_msgs</depend> 
