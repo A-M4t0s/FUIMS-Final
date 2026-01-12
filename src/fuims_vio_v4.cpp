@@ -25,9 +25,12 @@
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/slam/PriorFactor.h>
+#include <gtsam/slam/PoseRotationPrior.h>
+#include <gtsam/slam/PoseTranslationPrior.h>
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/geometry/Rot3.h>
 #include <gtsam/geometry/Point3.h>
+#include <gtsam/navigation/GPSFactor.h>
 
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc.hpp>
@@ -466,7 +469,9 @@ public:
 
       // Keyframe Decision (Parallax only)
       bool isKeyframe = false;
+      bool hasAlignment = false;
       Points trackedOnly;
+      static gtsam::Pose3 T_align;
 
       // Consider only features that are older than MAX_TRACKING_AGE
       for (size_t i = 0; i < currPoints.pts.size(); ++i)
@@ -481,6 +486,28 @@ public:
       if (!hasKF && trackedOnly.pts.size() >= MIN_TRACKED_FEATURES) // First Keyframe
       {
         isKeyframe = true;
+
+        if (!hasAlignment && !gpsSamples.empty())
+        {
+          // Get first GPS pose in ENU
+          double X, Y, Z;
+          geodeticToECEF(gpsSamples.front().lat, gpsSamples.front().lon, gpsSamples.front().alt, X, Y, Z);
+          ENU enu = ecefToENU(X, Y, Z,
+                              gpsSamples.front().lat,
+                              gpsSamples.front().lon,
+                              gpsSamples.front().alt);
+
+          gtsam::Point3 gps_pos(enu.x, enu.y, enu.z);
+          gtsam::Pose3 gps_pose(gtsam::Rot3(), gps_pos); // assume flat orientation
+
+          // First VIO pose is at identity
+          gtsam::Pose3 vio_pose = gtsam::Pose3(); // or use: isam.calculateEstimate(...)
+
+          // Compute transform from VIO frame to GPS frame
+          T_align = gps_pose.compose(vio_pose.inverse());
+
+          hasAlignment = true;
+        }
       }
       else if (hasKF && trackedOnly.pts.size() >= MIN_TRACKED_FEATURES) // Subsequent Keyframes
       {
@@ -515,11 +542,13 @@ public:
         {
           const int prevKF = kfIndex;
           const int currKF = kfIndex + 1;
+          bool hasConstraint = false; // Track if anything was added to the graph
 
+          // Get previous pose estimate
           gtsam::Pose3 prevPose = isam.calculateEstimate<gtsam::Pose3>(gtsam::Symbol('x', prevKF));
-          gtsam::Pose3 currGuess = prevPose; // default guess if nothing else works
+          gtsam::Pose3 currGuess = prevPose; // default guess if no info
 
-          // Step 1: VO Between Factor
+          // Step 1: Visual Odometry (BetweenFactor)
           std::vector<cv::Point2f> prevKFPoints, currKFPoints;
           buildCorrespondencesById(lastKF.points, trackedOnly, prevKFPoints, currKFPoints);
 
@@ -527,7 +556,6 @@ public:
           {
             gtsam::Pose3 relativePose = relativeMovementEstimation(prevKFPoints, currKFPoints, lastKF.timestamp, kfTime);
 
-            // Compose to get initial guess
             currGuess = prevPose.compose(relativePose);
 
             auto voNoise = gtsam::noiseModel::Diagonal::Sigmas(
@@ -538,6 +566,9 @@ public:
                 gtsam::Symbol('x', currKF),
                 relativePose,
                 voNoise));
+
+            hasConstraint = true;
+            OK("[Keyframe " << currKF << "] VO between factor added.");
           }
           else
           {
@@ -546,7 +577,7 @@ public:
             currGuess = prevPose; // fallback
           }
 
-          // Step 2: Quaternion Prior Factor
+          // Step 2: Quaternion Prior (rotation-only)
           auto qmsg = findNearestQuat(kfTime);
           if (qmsg)
           {
@@ -556,17 +587,18 @@ public:
                 qmsg->quaternion.y,
                 qmsg->quaternion.z);
 
-            gtsam::Pose3 rotPrior(Rq, gtsam::Point3(0, 0, 0));
-
             auto rotNoise = gtsam::noiseModel::Diagonal::Sigmas(
-                (gtsam::Vector(6) << 0.05, 0.05, 0.05, 1e6, 1e6, 1e6).finished());
+                (gtsam::Vector(3) << 0.05, 0.05, 0.05).finished());
 
-            graph.add(gtsam::PriorFactor<gtsam::Pose3>(
+            graph.add(gtsam::PoseRotationPrior<gtsam::Pose3>(
                 gtsam::Symbol('x', currKF),
-                rotPrior,
+                Rq,
                 rotNoise));
 
-            // Update orientation guess if VO failed
+            hasConstraint = true;
+            OK("[Keyframe " << currKF << "] Orientation prior added from quaternion.");
+
+            // If VO failed, use orientation as fallback guess
             if (prevKFPoints.size() < 16)
             {
               gtsam::Point3 t = prevPose.translation();
@@ -574,39 +606,114 @@ public:
             }
           }
 
-          // Step 3: Velocity Between Factor
+          // Step 3: Velocity integration)
+          Eigen::Vector3d dp_world;
           {
-            Eigen::Vector3d dp_world = integrateVelocity(lastKF.timestamp, kfTime);
+            dp_world = integrateVelocity(lastKF.timestamp, kfTime);
+
+            // Transform delta to local frame of prev pose
+            gtsam::Pose3 prevPose = isam.calculateEstimate<gtsam::Pose3>(gtsam::Symbol('x', prevKF));
             Eigen::Vector3d dp_local = prevPose.rotation().unrotate(dp_world);
-            gtsam::Point3 dp_gtsam(dp_local);
 
-            gtsam::Pose3 velDelta(gtsam::Rot3(), dp_gtsam);
-
-            // Update translation if nothing else was used
-            if (prevKFPoints.size() < 16 && !qmsg)
-            {
-              currGuess = prevPose.compose(velDelta);
-            }
+            gtsam::Pose3 velDelta(gtsam::Rot3(), dp_local);
 
             auto velNoise = gtsam::noiseModel::Diagonal::Sigmas(
-                (gtsam::Vector(6) << 1e6, 1e6, 1e6, 0.3, 0.3, 0.3).finished());
+                (gtsam::Vector(6) << 1e6, 1e6, 1e6, 0.8, 0.8, 0.8).finished());
 
             graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
                 gtsam::Symbol('x', prevKF),
                 gtsam::Symbol('x', currKF),
                 velDelta,
                 velNoise));
+
+            hasConstraint = true;
+
+            OK("[Keyframe " << currKF << "] Velocity-based between factor added.");
           }
 
-          // Step 4: Insert and update
-          values.insert(gtsam::Symbol('x', currKF), currGuess);
+          // Step 4: GPS Prior (absolute translation only)
+          if (kfIndex % GPS_PRIOR_INTERVAL == 0)
+          {
+            double t_kf_sec = kfTime.toSec();
+            double best_dt = 1e9;
+            size_t best_idx = 0;
 
-          isam.update(graph, values);
-          graph.resize(0);
-          values.clear();
+            for (size_t i = 0; i < gpsSamples.size(); i++)
+            {
+              double dt = std::abs(gpsSamples[i].t.toSec() - t_kf_sec);
+              if (dt < best_dt)
+              {
+                best_dt = dt;
+                best_idx = i;
+              }
+            }
 
-          // Publish current pose
+            const GpsSample &gps = gpsSamples[best_idx];
+
+            double X, Y, Z;
+            geodeticToECEF(gps.lat, gps.lon, gps.alt, X, Y, Z);
+            ENU enu = ecefToENU(X, Y, Z,
+                                gpsSamples.front().lat,
+                                gpsSamples.front().lon,
+                                gpsSamples.front().alt);
+
+            gtsam::Point3 gps_point(enu.x, enu.y, enu.z);
+
+            auto posNoise = gtsam::noiseModel::Diagonal::Sigmas(
+                (gtsam::Vector(3) << 0.1, 0.1, 0.1).finished());
+
+            // Add GPS prior (on translation only)
+            graph.add(gtsam::PoseTranslationPrior<gtsam::Pose3>(
+                gtsam::Symbol('x', currKF),
+                gps_point,
+                posNoise));
+
+            ROS_INFO_STREAM(GREEN << "[Keyframe " << currKF << "] GPS translation prior added." << RESET);
+          }
+
+          bool hasTranslation =
+              (prevKFPoints.size() >= 16) ||
+              (dp_world.norm() > 0.05) ||
+              (kfIndex % GPS_PRIOR_INTERVAL == 0);
+
+          if (!hasTranslation)
+          {
+            auto weakPosNoise = gtsam::noiseModel::Diagonal::Sigmas(
+                (gtsam::Vector(3) << 5.0, 5.0, 5.0).finished());
+
+            graph.add(gtsam::PoseTranslationPrior<gtsam::Pose3>(
+                gtsam::Symbol('x', currKF),
+                prevPose.translation(),
+                weakPosNoise));
+
+            WARN("[Keyframe " << currKF << "] Weak translation prior added (safety)");
+          }
+
+          // Step 5: Insert initial guess and update ISAM
+          if (hasConstraint)
+          {
+            if (isam.getLinearizationPoint().exists(gtsam::Symbol('x', currKF)))
+            {
+              WARN("x" << currKF << " already in ISAM. Skipping.");
+              continue;
+            }
+
+            values.insert(gtsam::Symbol('x', currKF), currGuess);
+            isam.update(graph, values);
+
+            graph.resize(0);
+            values.clear();
+          }
+          else
+          {
+            WARN("[Keyframe " << currKF << "] No constraints added to graph. Skipping ISAM update.");
+            continue;
+          }
+
+          // Publish estimated pose
           gtsam::Pose3 estimatedPose = isam.calculateEstimate<gtsam::Pose3>(gtsam::Symbol('x', currKF));
+          if (hasAlignment)
+            estimatedPose = T_align.compose(estimatedPose);
 
           geometry_msgs::PoseStamped poseMsg;
           poseMsg.header.stamp = kfTime;
@@ -616,22 +723,20 @@ public:
           poseMsg.pose.position.z = estimatedPose.z();
 
           gtsam::Rot3 R = estimatedPose.rotation();
-          gtsam::Quaternion q = R.toQuaternion(); // gtsam::Quaternion is Eigen-compatible
+          gtsam::Quaternion q = R.toQuaternion();
 
           poseMsg.pose.orientation.w = q.w();
           poseMsg.pose.orientation.x = q.x();
           poseMsg.pose.orientation.y = q.y();
           poseMsg.pose.orientation.z = q.z();
 
-          // Append to path
+          // Append and publish path
           pathMsg.header.stamp = kfTime;
           pathMsg.poses.push_back(poseMsg);
-
-          // Publish path and current pose
           pathPub.publish(pathMsg);
           posePub.publish(poseMsg);
 
-          // Update last keyframe
+          // Update KF state
           kfIndex = currKF;
           kfTimes.push_back(kfTime.toSec());
           lastKF.frameID = frameIdx;
