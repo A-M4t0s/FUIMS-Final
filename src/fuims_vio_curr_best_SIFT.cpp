@@ -101,13 +101,10 @@ public:
             return;
         }
 
-        // Creating ORB Detector (maxFeatures = 1000 | score = Harris)
-        // orb = cv::ORB::create(1000);
-
-        // nFeatures, nOctaveLayers, contrastThreshold, edgeThreshold, sigma
+        // Creating SIFT detector structure.
+        // Using default configuration
         sift = cv::SIFT::create();
-        // sift = cv::SIFT::create(4000, 3, 0.03, 10, 1.6);
-
+        
         // ROSBAG Processing
         processBag();
 
@@ -123,7 +120,6 @@ private:
     rosbag::Bag bag;
 
     // OpenCV Variables
-    // cv::Ptr<cv::ORB> orb; // ORB Features Detection
     cv::Ptr<cv::SIFT> sift; // SIFT Features Detection
 
     // Camera Params
@@ -229,15 +225,13 @@ private:
             }
 
             cv::Mat raw = cv::imdecode(msg->data, cv::IMREAD_COLOR);
-            cv::Mat rgb;
-            cv::cvtColor(raw, rgb, cv::COLOR_BGR2RGB);
-            if (rgb.empty())
+            if (raw.empty())
             {
                 ++idx;
                 continue;
             }
 
-            cv::Mat undist = undistortImage(rgb);
+            cv::Mat undist = undistortImage(raw);
             undistortedRGB.push_back(undist);
 
             cv::Mat gray;
@@ -258,10 +252,8 @@ private:
         ros::WallTime start_time = ros::WallTime::now();
         ROS_INFO("Starting featureDetection()");
 
-        keypoints.clear();
-        descriptors.clear();
-
-        const int nBest = 300; // nº máximo de features por imagem
+        // Defining the desired feature total
+        const int nBest = 300;
 
         std::vector<cv::KeyPoint> kp;
         cv::Mat desc;
@@ -271,25 +263,24 @@ private:
             kp.clear();
             desc.release();
 
-            // Detetar SIFT na imagem cinzenta
+            // SIFT Feature Detection in gray image
             sift->detectAndCompute(undistortedGray[i], cv::noArray(), kp, desc);
 
-            // Se não houver keypoints/descs, salta
             if (kp.empty() || desc.empty())
             {
-                keypoints.push_back(std::vector<cv::KeyPoint>()); // placeholder
+                keypoints.push_back(std::vector<cv::KeyPoint>());
                 descriptors.push_back(cv::Mat());
                 continue;
             }
 
-            // Selecionar explicitamente as 300 MAIS FORTES (maior response)
+            // Selecting the nBest features
             if (static_cast<int>(kp.size()) > nBest)
             {
-                // índices 0..N-1
+                // Indexes
                 std::vector<int> indices(kp.size());
                 std::iota(indices.begin(), indices.end(), 0);
 
-                // ordenar indices por response DESC
+                // Ordering Indexes (High to Low)
                 std::sort(indices.begin(), indices.end(),
                           [&](int a, int b)
                           {
@@ -311,7 +302,7 @@ private:
                 }
 
                 kp.swap(kp_best);
-                desc = desc_best; // agora só 300 linhas
+                desc = desc_best;
             }
 
             keypoints.push_back(kp);

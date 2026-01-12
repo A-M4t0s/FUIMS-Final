@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(fuims)
 
+
 ## Compile as C++11, supported in ROS Kinetic and newer
 # add_compile_options(-std=c++11)
 add_compile_options(-std=c++14)
@@ -157,6 +158,7 @@ include_directories(
 ## The recommended prefix ensures that target names across packages don't collide
 # add_executable(${PROJECT_NAME}_node src/fuims_node.cpp)
 add_executable(fuims_final src/fuims_vio_v2.cpp)
+add_executable(fuims_tester src/fuims_vio_v4.cpp)
 add_executable(bag_updater src/rosbag_correction.cpp)
 
 ## Rename C++ executable without prefix
@@ -169,6 +171,7 @@ add_executable(bag_updater src/rosbag_correction.cpp)
 ## same as for the library above
 # add_dependencies(${PROJECT_NAME}_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 add_dependencies(fuims_final ${catkin_EXPORTED_TARGETS})
+add_dependencies(fuims_tester ${catkin_EXPORTED_TARGETS})
 add_dependencies(bag_updater ${catkin_EXPORTED_TARGETS})
 
 ## Specify libraries to link a library or executable target against
@@ -176,6 +179,12 @@ add_dependencies(bag_updater ${catkin_EXPORTED_TARGETS})
 #   ${catkin_LIBRARIES}
 # )
 target_link_libraries(fuims_final
+  ${catkin_LIBRARIES}
+  ${OpenCV_LIBS}
+  gtsam
+)
+
+target_link_libraries(fuims_tester
   ${catkin_LIBRARIES}
   ${OpenCV_LIBS}
   gtsam
@@ -206,6 +215,10 @@ target_link_libraries(bag_updater
 #   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 # )
 install(TARGETS fuims_final
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(TARGETS fuims_tester
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

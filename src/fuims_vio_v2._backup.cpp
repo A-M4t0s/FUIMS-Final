@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <numeric>
 #include <Eigen/Dense>
+#include <unordered_map>
 
 #include <gtsam/linear/NoiseModel.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
@@ -33,6 +34,9 @@
 #include <opencv2/video.hpp>
 
 #include <signal.h>
+#include <fstream>
+#include <cstdlib>
+#include <iomanip>
 
 #define BAG_PATH "/home/tony/catkin_ws/bags/bags_fuims/agucadoura.bag"
 #define CAMERA_TOPIC "/dji_m350/cameras/main/compressed"
@@ -69,6 +73,15 @@ struct Keyframe
     cv::Mat greyImg;
 };
 
+struct GpsSample
+{
+    ros::Time t; // bag time (robusto)
+    double lat;  // radians
+    double lon;  // radians
+    double alt;  // meters
+};
+
+// lat/lon MUST be radians here
 void geodeticToECEF(double lat, double lon, double alt, double &X, double &Y, double &Z)
 {
     double sinLat = sin(lat), cosLat = cos(lat);
@@ -81,8 +94,7 @@ void geodeticToECEF(double lat, double lon, double alt, double &X, double &Y, do
     Z = (b * b / (a * a) * N + alt) * sinLat;
 }
 
-ENU ecefToENU(double X, double Y, double Z,
-              double lat0, double lon0, double alt0)
+ENU ecefToENU(double X, double Y, double Z, double lat0, double lon0, double alt0)
 {
     double X0, Y0, Z0;
     geodeticToECEF(lat0, lon0, alt0, X0, Y0, Z0);
@@ -101,6 +113,20 @@ ENU ecefToENU(double X, double Y, double Z,
 
     return enu;
 }
+
+Eigen::Quaterniond convertNEDtoENU(const Eigen::Quaterniond &q_ned)
+{
+    Eigen::Matrix3d R_ned_to_enu;
+    R_ned_to_enu << 0, 1, 0,
+                    1, 0, 0,
+                    0, 0, -1;
+
+    Eigen::Quaterniond q_tf(R_ned_to_enu);
+
+    // Passive frame transformation: q_enu = R * q_ned * R⁻¹
+    return q_tf * q_ned * q_tf.inverse();
+}
+
 
 // =========================================================
 // Signal Handling
@@ -145,39 +171,102 @@ public:
         for (const rosbag::MessageInstance &m : quat_view)
         {
             auto msg = m.instantiate<geometry_msgs::QuaternionStamped>();
-            if (msg)
-                quatMsgs.push_back(msg);
+            if (!msg)
+                continue;
+
+            Eigen::Quaterniond q_ned(
+                msg->quaternion.w,
+                msg->quaternion.x,
+                msg->quaternion.y,
+                msg->quaternion.z);
+
+            // Convert from NED to ENU
+            Eigen::Quaterniond q_enu = convertNEDtoENU(q_ned);
+
+            // Debug: compare Euler angles (for sanity check)
+            Eigen::Vector3d ned_euler = q_ned.toRotationMatrix().eulerAngles(2, 1, 0); // ZYX: yaw, pitch, roll
+            Eigen::Vector3d enu_euler = q_enu.toRotationMatrix().eulerAngles(2, 1, 0);
+
+            ROS_INFO_STREAM_THROTTLE(2.0,
+                                     "[Quat @ " << msg->header.stamp << "]\n"
+                                                << "NED Euler (yaw, pitch, roll) = "
+                                                << ned_euler[0] * 180.0 / M_PI << ", "
+                                                << ned_euler[1] * 180.0 / M_PI << ", "
+                                                << ned_euler[2] * 180.0 / M_PI << "\n"
+                                                << "ENU Euler (yaw, pitch, roll) = "
+                                                << enu_euler[0] * 180.0 / M_PI << ", "
+                                                << enu_euler[1] * 180.0 / M_PI << ", "
+                                                << enu_euler[2] * 180.0 / M_PI);
+
+            // Store converted quaternion into quatMsgs
+            geometry_msgs::QuaternionStampedPtr newMsg(new geometry_msgs::QuaternionStamped(*msg));
+            newMsg->quaternion.w = q_enu.w();
+            newMsg->quaternion.x = q_enu.x();
+            newMsg->quaternion.y = q_enu.y();
+            newMsg->quaternion.z = q_enu.z();
+
+            quatMsgs.push_back(newMsg);
         }
-        ROS_INFO("Loaded %zu quaternion messages", quatMsgs.size());
+
+        ROS_INFO("Loaded and converted %zu quaternion messages (NED ➝ ENU)", quatMsgs.size());
 
         rosbag::View vel_view(bag, rosbag::TopicQuery(VELOCITY_TOPIC));
         for (const rosbag::MessageInstance &m : vel_view)
         {
             auto msg = m.instantiate<geometry_msgs::Vector3Stamped>();
-            if (msg)
-                velMsgs.push_back(msg);
-        }
-        ROS_INFO("Loaded %zu velocity messages", velMsgs.size());
+            if (!msg)
+                continue;
 
+            // Convert velocity from NED to ENU
+            geometry_msgs::Vector3StampedPtr newMsg(new geometry_msgs::Vector3Stamped(*msg));
+
+            const auto &v_ned = msg->vector;
+
+            newMsg->vector.x = v_ned.y;  // ENU X = East  = NED Y
+            newMsg->vector.y = v_ned.x;  // ENU Y = North = NED X
+            newMsg->vector.z = -v_ned.z; // ENU Z = Up    = -NED Z
+
+            velMsgs.push_back(newMsg);
+        }
+        ROS_INFO("Loaded and converted %zu velocity messages (NED ➝ ENU)", velMsgs.size());
+        if (velMsgs.size() > 0)
+        {
+            const auto &sample = velMsgs.front();
+            ROS_INFO("[Velocity ENU] t=%.3f | x=%.3f, y=%.3f, z=%.3f",
+                     sample->header.stamp.toSec(),
+                     sample->vector.x,
+                     sample->vector.y,
+                     sample->vector.z);
+        }
+
+        // GPS: guardar o TEMPO do bag e valores (lat/lon já em radianos neste bag)
         rosbag::View gps_view(bag, rosbag::TopicQuery(GPS_TOPIC));
         for (const rosbag::MessageInstance &m : gps_view)
         {
             auto msg = m.instantiate<sensor_msgs::NavSatFix>();
-            if (msg)
-                gpsMsgs.push_back(msg);
+            if (!msg)
+                continue;
+
+            GpsSample s;
+            s.t = m.getTime();      // robusto
+            s.lat = msg->latitude;  // radians
+            s.lon = msg->longitude; // radians
+            s.alt = msg->altitude;  // meters
+            gpsSamples.push_back(s);
         }
-        ROS_INFO("Loaded %zu GPS messages", gpsMsgs.size());
+        ROS_INFO("Loaded %zu GPS messages", gpsSamples.size());
 
         orb = cv::ORB::create(750);
 
         // =========================================================
         // GTSAM init
+        // IMPORTANT: Pose3 noise order is [rot_x rot_y rot_z trans_x trans_y trans_z]
         // =========================================================
         gtsam::Pose3 prior; // identity
-        noise = gtsam::noiseModel::Diagonal::Sigmas(
+        auto priorNoise = gtsam::noiseModel::Diagonal::Sigmas(
             (gtsam::Vector(6) << 0.1, 0.1, 0.1, 0.1, 0.1, 0.1).finished());
 
-        graph.add(gtsam::PriorFactor<gtsam::Pose3>(gtsam::Symbol('x', 0), prior, noise));
+        graph.add(gtsam::PriorFactor<gtsam::Pose3>(gtsam::Symbol('x', 0), prior, priorNoise));
         values.insert(gtsam::Symbol('x', 0), prior);
 
         bool firstFrame = true;
@@ -206,6 +295,11 @@ public:
             }
 
             undistortImage(imgMsg);
+            if (currUndistortedGrey.empty())
+            {
+                frameIdx++;
+                continue;
+            }
 
             if (firstFrame)
             {
@@ -217,10 +311,8 @@ public:
                 continue;
             }
 
-            // =========================================================
-            // If too few prev points -> reset tracking (mas NÃO destruímos o KF global)
-            // =========================================================
-            if (prevPoints.pts.size() < 25)
+            // If too few prev points -> reset tracking (do NOT destroy global KF)
+            if (prevPoints.pts.size() < 25 || prevUndistortedGrey.empty())
             {
                 ROS_WARN("No previous points to track, detecting new features");
                 featureDetection(currUndistortedGrey);
@@ -277,7 +369,7 @@ public:
             }
 
             currPoints = currFiltered;
-            Points trackedOnly = currPoints; // antes de replenish
+            Points trackedOnly = currPoints; // before replenish
 
             if (currPoints.pts.size() < KF_FEATURE_THRESHOLD)
             {
@@ -299,8 +391,6 @@ public:
             else
             {
                 double kfParallax = 0.0;
-
-                // Só faz sentido medir paralaxe se tens tracking minimamente válido
                 if (trackedOnly.pts.size() >= 15)
                     kfParallax = computeKFParallax(lastKF, trackedOnly);
 
@@ -309,20 +399,18 @@ public:
                 if (kfParallax > KF_PARALLAX_THRESHOLD)
                     isKeyframe = true;
 
-                // tracking fraco -> força KF
                 if (trackedOnly.pts.size() < KF_FEATURE_THRESHOLD)
                     isKeyframe = true;
             }
 
             // =========================================================
-            // Handle keyframe (KF SEMPRE COMMIT)
+            // Handle keyframe (KF ALWAYS COMMIT) + store KF timestamp vector
             // =========================================================
             if (isKeyframe)
             {
                 ROS_WARN("=== New Keyframe at frame %d ===", frameIdx);
                 const ros::Time t_kf = m.getTime();
 
-                // Primeiro KF: só define referência visual
                 if (!hasKF)
                 {
                     lastKF.frameID = frameIdx;
@@ -331,61 +419,53 @@ public:
                     lastKF.timestamp = t_kf;
                     hasKF = true;
                     kfIndex = 0;
+
+                    kfTimes.clear();
+                    kfTimes.push_back(t_kf.toSec()); // node 0 time
                 }
                 else
                 {
                     const int prevK = kfIndex;
                     const int curK = kfIndex + 1;
 
-                    // Correspondências KF->cur por ID
                     std::vector<cv::Point2f> kfPts, curPtsFromKF;
                     buildCorrespondencesById(lastKF.points, currPoints, kfPts, curPtsFromKF);
 
-                    bool hasVisual = false;
-
-                    // --- Visual factor se possível
+                    // Seed always exists (either visual compose or keep previous)
                     if (kfPts.size() >= 8)
                     {
-                        hasVisual = true;
+                        gtsam::Pose3 T_kf_curr = relativeMovementEstimation(kfPts, curPtsFromKF, lastKF.timestamp, t_kf);
 
-                        gtsam::Pose3 T_kf_curr = relativeMovementEstimation(kfPts, curPtsFromKF);
-
-                        auto odomNoise = gtsam::noiseModel::Diagonal::Sigmas(
-                            (gtsam::Vector(6) << 0.2, 0.2, 0.2, 0.1, 0.1, 0.1).finished());
+                        auto voNoise = gtsam::noiseModel::Diagonal::Sigmas(
+                            (gtsam::Vector(6) << 0.1, 0.1, 0.1, 0.5, 0.5, 0.5).finished());
 
                         graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
                             gtsam::Symbol('x', prevK),
                             gtsam::Symbol('x', curK),
                             T_kf_curr,
-                            odomNoise));
+                            voNoise));
 
                         gtsam::Pose3 seed =
                             values.at<gtsam::Pose3>(gtsam::Symbol('x', prevK)).compose(T_kf_curr);
-
                         values.insert(gtsam::Symbol('x', curK), seed);
                     }
                     else
                     {
-                        // --- Seed dead-reckoning (mantém pose anterior)
                         values.insert(
                             gtsam::Symbol('x', curK),
                             values.at<gtsam::Pose3>(gtsam::Symbol('x', prevK)));
 
-                        ROS_WARN("VO unavailable (KF correspondences=%zu) -> dead-reckoning KF", kfPts.size());
+                        ROS_WARN("VO unavailable (KF correspondences=%zu) -> dead-reckoning seed", kfPts.size());
                     }
 
-                    // --- Velocity factor (sempre)
+                    // Velocity factor (always): translation strong, rotation none
                     {
                         Eigen::Vector3d dp = integrateVelocity(lastKF.timestamp, t_kf);
 
-                        gtsam::Pose3 velDelta(
-                            gtsam::Rot3(),
-                            gtsam::Point3(dp.x(), dp.y(), dp.z()));
+                        gtsam::Pose3 velDelta(gtsam::Rot3(), gtsam::Point3(dp.x(), dp.y(), dp.z()));
 
                         auto velNoise = gtsam::noiseModel::Diagonal::Sigmas(
-                            (gtsam::Vector(6) << 0.3, 0.3, 0.3,
-                             1e6, 1e6, 1e6)
-                                .finished());
+                            (gtsam::Vector(6) << 1e6, 1e6, 1e6, 0.3, 0.3, 0.3).finished());
 
                         graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
                             gtsam::Symbol('x', prevK),
@@ -394,7 +474,7 @@ public:
                             velNoise));
                     }
 
-                    // --- Quaternion prior (sempre que existir)
+                    // Quaternion prior: rotation strong, translation none
                     {
                         auto qmsg = findNearestQuat(t_kf);
                         if (qmsg)
@@ -408,9 +488,7 @@ public:
                             gtsam::Pose3 rotPrior(Rq, gtsam::Point3(0, 0, 0));
 
                             auto rotNoise = gtsam::noiseModel::Diagonal::Sigmas(
-                                (gtsam::Vector(6) << 1e6, 1e6, 1e6,
-                                 0.05, 0.05, 0.05)
-                                    .finished());
+                                (gtsam::Vector(6) << 0.05, 0.05, 0.05, 1e6, 1e6, 1e6).finished());
 
                             graph.add(gtsam::PriorFactor<gtsam::Pose3>(
                                 gtsam::Symbol('x', curK),
@@ -419,46 +497,94 @@ public:
                         }
                     }
 
-                    // Commit KF SEMPRE
+                    // Commit KF always
                     kfIndex = curK;
+                    kfTimes.push_back(t_kf.toSec()); // node curK time
 
-                    // Atualiza referência KF SEMPRE (para evitar “parallax 0 para sempre”)
+                    // Update KF reference always
                     lastKF.frameID = frameIdx;
                     lastKF.greyImg = currUndistortedGrey.clone();
                     lastKF.points = currPoints;
                     lastKF.timestamp = t_kf;
+
+                    // Add GPS prior every N keyframes
+                    const int GPS_PRIOR_INTERVAL = 20;
+                    if (kfIndex % GPS_PRIOR_INTERVAL == 0)
+                    {
+                        // Find nearest GPS to this keyframe time
+                        double t_kf_sec = t_kf.toSec();
+                        double best_dt = 1e9;
+                        size_t best_idx = 0;
+
+                        for (size_t i = 0; i < gpsSamples.size(); i++)
+                        {
+                            double dt = std::abs(gpsSamples[i].t.toSec() - t_kf_sec);
+                            if (dt < best_dt)
+                            {
+                                best_dt = dt;
+                                best_idx = i;
+                            }
+                        }
+
+                        const GpsSample &gps = gpsSamples[best_idx];
+
+                        // Convert GPS to ENU (relative to first GPS sample)
+                        double X, Y, Z;
+                        geodeticToECEF(gps.lat, gps.lon, gps.alt, X, Y, Z);
+                        ENU enu = ecefToENU(X, Y, Z,
+                                            gpsSamples.front().lat,
+                                            gpsSamples.front().lon,
+                                            gpsSamples.front().alt);
+
+                        gtsam::Point3 gpsENU(enu.x, enu.y, enu.z);
+
+                        // Create Pose3 with GPS translation and identity rotation
+                        gtsam::Pose3 gpsPose(gtsam::Rot3(), gpsENU);
+
+                        // Noise: loose on rotation (effectively unconstrained), tighter on position
+                        auto gpsNoise = gtsam::noiseModel::Diagonal::Sigmas(
+                            (gtsam::Vector(6) << 1e6, 1e6, 1e6, 0.05, 0.05, 0.05).finished());
+
+                        // Add GPS prior
+                        graph.add(gtsam::PriorFactor<gtsam::Pose3>(
+                            gtsam::Symbol('x', kfIndex),
+                            gpsPose,
+                            gpsNoise));
+
+                        ROS_INFO("Added GPS prior at keyframe %d (dt=%.3fs)", kfIndex, best_dt);
+                    }
                 }
             }
 
             // =========================================================
-            // Debug publish (sempre dentro do loop)
+            // Debug publish (inside loop)
             // =========================================================
-            if (!prevUndistortedGrey.empty() && !currUndistortedGrey.empty())
-            {
-                cv::Mat prevBgr, currBgr;
-                cv::cvtColor(prevUndistortedGrey, prevBgr, cv::COLOR_GRAY2BGR);
-                cv::cvtColor(currUndistortedGrey, currBgr, cv::COLOR_GRAY2BGR);
+            // if (!prevUndistortedGrey.empty() && !currUndistortedGrey.empty())
+            // {
+            //     cv::Mat prevBgr, currBgr;
+            //     cv::cvtColor(prevUndistortedGrey, prevBgr, cv::COLOR_GRAY2BGR);
+            //     cv::cvtColor(currUndistortedGrey, currBgr, cv::COLOR_GRAY2BGR);
 
-                cv::Mat debugImg;
-                cv::hconcat(prevBgr, currBgr, debugImg);
+            //     cv::Mat debugImg;
+            //     cv::hconcat(prevBgr, currBgr, debugImg);
 
-                int offsetX = prevBgr.cols;
-                for (size_t k = 0; k < prevValid.size(); k++)
-                {
-                    cv::Point2f p1 = prevValid[k];
-                    cv::Point2f p2 = currValid[k] + cv::Point2f((float)offsetX, 0.0f);
+            //     int offsetX = prevBgr.cols;
+            //     for (size_t k = 0; k < prevValid.size(); k++)
+            //     {
+            //         cv::Point2f p1 = prevValid[k];
+            //         cv::Point2f p2 = currValid[k] + cv::Point2f((float)offsetX, 0.0f);
 
-                    cv::circle(debugImg, p1, 3, cv::Scalar(0, 255, 0), -1);
-                    cv::circle(debugImg, p2, 3, cv::Scalar(0, 0, 255), -1);
-                    cv::line(debugImg, p1, p2, cv::Scalar(255, 0, 0), 1);
-                }
+            //         cv::circle(debugImg, p1, 3, cv::Scalar(0, 255, 0), -1);
+            //         cv::circle(debugImg, p2, 3, cv::Scalar(0, 0, 255), -1);
+            //         cv::line(debugImg, p1, p2, cv::Scalar(255, 0, 0), 1);
+            //     }
 
-                sensor_msgs::ImagePtr debugMsg =
-                    cv_bridge::CvImage(std_msgs::Header(), "bgr8", debugImg).toImageMsg();
+            //     sensor_msgs::ImagePtr debugMsg =
+            //         cv_bridge::CvImage(std_msgs::Header(), "bgr8", debugImg).toImageMsg();
 
-                debugMsg->header.stamp = m.getTime();
-                debugPub.publish(debugMsg);
-            }
+            //     debugMsg->header.stamp = m.getTime();
+            //     debugPub.publish(debugMsg);
+            // }
 
             // Next iteration
             prevUndistortedGrey = currUndistortedGrey.clone();
@@ -479,102 +605,139 @@ public:
         values = optimizer.optimize();
         ROS_INFO("Optimization complete.");
 
+        if (kfIndex < 0 || (int)kfTimes.size() < (kfIndex + 1))
+        {
+            ROS_ERROR("KF timeline inconsistent: kfIndex=%d kfTimes=%zu", kfIndex, kfTimes.size());
+            bag.close();
+            return;
+        }
+
         // =========================================================
-        // Extract optimized trajectory
+        // Extract optimized trajectory + timestamps
         // =========================================================
-        std::vector<gtsam::Pose3> optimizedPoses;
-        optimizedPoses.reserve(kfIndex + 1);
+        std::vector<double> vioT;
+        std::vector<Eigen::Vector3d> vioXYZ;
+        vioT.reserve(kfIndex + 1);
+        vioXYZ.reserve(kfIndex + 1);
 
         for (int k = 0; k <= kfIndex; k++)
         {
             gtsam::Pose3 pose = values.at<gtsam::Pose3>(gtsam::Symbol('x', k));
-            optimizedPoses.push_back(pose);
+            vioT.push_back(kfTimes[k]);
+            vioXYZ.push_back(pose.translation());
         }
 
+        // make VIO relative to first
+        const Eigen::Vector3d vio0 = vioXYZ.front();
+        for (auto &p : vioXYZ)
+            p -= vio0;
+
         // =========================================================
-        // GPS -> ENU
+        // GPS -> ENU with timestamps (relative)
+        // IMPORTANT: GPS lat/lon are ALREADY radians in this bag
         // =========================================================
-        if (gpsMsgs.empty())
+        if (gpsSamples.empty())
         {
             ROS_ERROR("No GPS messages available!");
             bag.close();
             return;
         }
 
-        std::vector<ENU> gpsENU;
-        gpsENU.reserve(gpsMsgs.size());
+        const double lat0 = gpsSamples.front().lat; // radians
+        const double lon0 = gpsSamples.front().lon; // radians
+        const double alt0 = gpsSamples.front().alt;
 
-        double lat0 = gpsMsgs.front()->latitude * M_PI / 180.0;
-        double lon0 = gpsMsgs.front()->longitude * M_PI / 180.0;
-        double alt0 = gpsMsgs.front()->altitude;
+        std::vector<double> gpsT;
+        std::vector<Eigen::Vector3d> gpsXYZ;
+        gpsT.reserve(gpsSamples.size());
+        gpsXYZ.reserve(gpsSamples.size());
 
-        for (const auto &g : gpsMsgs)
+        for (const auto &g : gpsSamples)
         {
-            double lat = g->latitude * M_PI / 180.0;
-            double lon = g->longitude * M_PI / 180.0;
-            double alt = g->altitude;
-
             double X, Y, Z;
-            geodeticToECEF(lat, lon, alt, X, Y, Z);
-
+            geodeticToECEF(g.lat, g.lon, g.alt, X, Y, Z);
             ENU enu = ecefToENU(X, Y, Z, lat0, lon0, alt0);
-            gpsENU.push_back(enu);
+
+            gpsT.push_back(g.t.toSec());
+            gpsXYZ.emplace_back(enu.x, enu.y, enu.z);
         }
 
-        // =========================================================
-        // Drift XY final (comparação simples)
-        // =========================================================
-        std::vector<Eigen::Vector3d> vioPoints;
-        vioPoints.reserve(optimizedPoses.size());
+        // make GPS relative to first
+        const Eigen::Vector3d gps0 = gpsXYZ.front();
+        for (auto &p : gpsXYZ)
+            p -= gps0;
 
-        Eigen::Vector3d p0 = optimizedPoses.front().translation();
-        for (const auto &pose : optimizedPoses)
+        // =========================================================
+        // Drift final XY: compare by TIME (nearest GPS to last VIO time)
+        // =========================================================
+        const double t_end = vioT.back();
+        size_t best_i = 0;
+        double best_dt = 1e100;
+        for (size_t i = 0; i < gpsT.size(); i++)
         {
-            Eigen::Vector3d p = pose.translation() - p0;
-            vioPoints.push_back(p);
-        }
-
-        const auto &p_vio_end = vioPoints.back();
-        const auto &p_gps_end = gpsENU.back();
-
-        double dx = p_vio_end.x() - p_gps_end.x;
-        double dy = p_vio_end.y() - p_gps_end.y;
-
-        double drift_xy = std::sqrt(dx * dx + dy * dy);
-        ROS_INFO("Final XY drift vs GPS: %.2f m", drift_xy);
-
-        // =========================================================
-        // Save trajectory to CSV (for 3D plot)
-        // =========================================================
-        std::string home = std::getenv("HOME");
-        std::string csv_path = home + "/vio_vs_gps.csv";
-
-        std::ofstream csv(csv_path);
-        if (!csv.is_open())
-        {
-            ROS_ERROR("Failed to open CSV file: %s", csv_path.c_str());
-        }
-        else
-        {
-            csv << "t,vio_x,vio_y,vio_z,gps_x,gps_y,gps_z\n";
-
-            const size_t N = std::min(vioPoints.size(), gpsENU.size());
-
-            for (size_t i = 0; i < N; i++)
+            double dt = std::fabs(gpsT[i] - t_end);
+            if (dt < best_dt)
             {
-                csv << i << ","
-                    << vioPoints[i].x() << ","
-                    << vioPoints[i].y() << ","
-                    << vioPoints[i].z() << ","
-                    << gpsENU[i].x << ","
-                    << gpsENU[i].y << ","
-                    << gpsENU[i].z << "\n";
+                best_dt = dt;
+                best_i = i;
             }
-
-            csv.close();
-            ROS_INFO("Saved trajectory CSV to %s", csv_path.c_str());
         }
 
+        const Eigen::Vector3d p_vio_end = vioXYZ.back();
+        const Eigen::Vector3d p_gps_end = gpsXYZ[best_i];
+
+        const double dx = p_vio_end.x() - p_gps_end.x();
+        const double dy = p_vio_end.y() - p_gps_end.y();
+        const double drift_xy = std::sqrt(dx * dx + dy * dy);
+
+        ROS_INFO("Final XY drift vs GPS (time-matched, dt=%.3fs): %.2f m", best_dt, drift_xy);
+
+        // =========================================================
+        // Save CSVs to HOME (best practice: TWO CSVs + python script)
+        // =========================================================
+        const char *homeEnv = std::getenv("HOME");
+        std::string home = homeEnv ? std::string(homeEnv) : std::string(".");
+        const std::string vio_csv = home + "/vio_trajectory.csv";
+        const std::string gps_csv = home + "/gps_trajectory.csv";
+        const std::string py_path = home + "/plot_vio_vs_gps_3d.py";
+
+        {
+            std::ofstream f(vio_csv);
+            if (!f.is_open())
+                ROS_ERROR("Failed to open %s", vio_csv.c_str());
+            else
+            {
+                f << std::setprecision(15);
+                f << "t,x,y,z\n";
+                for (size_t i = 0; i < vioT.size(); i++)
+                {
+                    f << vioT[i] << ","
+                      << vioXYZ[i].x() << ","
+                      << vioXYZ[i].y() << ","
+                      << vioXYZ[i].z() << "\n";
+                }
+                ROS_INFO("Saved %s", vio_csv.c_str());
+            }
+        }
+
+        {
+            std::ofstream f(gps_csv);
+            if (!f.is_open())
+                ROS_ERROR("Failed to open %s", gps_csv.c_str());
+            else
+            {
+                f << std::setprecision(15);
+                f << "t,x,y,z\n";
+                for (size_t i = 0; i < gpsT.size(); i++)
+                {
+                    f << gpsT[i] << ","
+                      << gpsXYZ[i].x() << ","
+                      << gpsXYZ[i].y() << ","
+                      << gpsXYZ[i].z() << "\n";
+                }
+                ROS_INFO("Saved %s", gps_csv.c_str());
+            }
+        }
         bag.close();
     }
 
@@ -585,7 +748,7 @@ private:
 
     std::vector<geometry_msgs::QuaternionStampedConstPtr> quatMsgs;
     std::vector<geometry_msgs::Vector3StampedConstPtr> velMsgs;
-    std::vector<sensor_msgs::NavSatFixConstPtr> gpsMsgs;
+    std::vector<GpsSample> gpsSamples;
 
     const cv::Mat K = (cv::Mat_<double>(3, 3) << 1372.76165, 0.0, 960.45289,
                        0.0, 1372.14817, 515.00383,
@@ -606,15 +769,20 @@ private:
     int nextFeatureID = 0;
 
     gtsam::NonlinearFactorGraph graph;
-    gtsam::noiseModel::Diagonal::shared_ptr noise;
     gtsam::Values values;
+
+    std::vector<double> kfTimes;
 
 private:
     void undistortImage(sensor_msgs::CompressedImageConstPtr msg)
     {
         cv::Mat raw = cv::imdecode(msg->data, cv::IMREAD_COLOR);
         if (raw.empty())
+        {
+            currUndistortedGrey.release();
+            currUndistortedRGB.release();
             return;
+        }
 
         cv::undistort(raw, currUndistortedRGB, K, distCoeffs);
         cv::cvtColor(currUndistortedRGB, currUndistortedGrey, cv::COLOR_BGR2GRAY);
@@ -707,9 +875,10 @@ private:
         }
     }
 
-    gtsam::Pose3 relativeMovementEstimation(
-        std::vector<cv::Point2f> &prevValid,
-        std::vector<cv::Point2f> &currValid)
+    gtsam::Pose3 relativeMovementEstimation(std::vector<cv::Point2f> &prevValid,
+                                            std::vector<cv::Point2f> &currValid,
+                                            const ros::Time &t0,
+                                            const ros::Time &t1)
     {
         if (prevValid.size() < 8 || currValid.size() < 8)
         {
@@ -727,34 +896,64 @@ private:
         cv::Mat R, t;
         cv::recoverPose(E, prevValid, currValid, K, R, t);
 
+        // Recover rotation
         Eigen::Matrix3d Rg_mat;
         Rg_mat << R.at<double>(0, 0), R.at<double>(0, 1), R.at<double>(0, 2),
             R.at<double>(1, 0), R.at<double>(1, 1), R.at<double>(1, 2),
             R.at<double>(2, 0), R.at<double>(2, 1), R.at<double>(2, 2);
 
-        gtsam::Rot3 Rg(Rg_mat);
+        // Recover unscaled translation
+        Eigen::Vector3d t_dir(t.at<double>(0), t.at<double>(1), t.at<double>(2));
 
-        gtsam::Point3 tg(
-            t.at<double>(0),
-            t.at<double>(1),
-            t.at<double>(2));
+        // Scale using integrated velocity (rotated)
+        Eigen::Vector3d dp = integrateVelocity(t0, t1);
+        double scale = dp.norm();
+
+        if (scale < 1e-2)
+        {
+            ROS_WARN("Velocity integration too small for scaling. Skipping scale correction.");
+            scale = 1.0; // fallback
+        }
+
+        Eigen::Vector3d t_scaled = t_dir.normalized() * scale;
+
+        gtsam::Rot3 Rg(Rg_mat);
+        gtsam::Point3 tg(t_scaled.x(), t_scaled.y(), t_scaled.z());
 
         return gtsam::Pose3(Rg, tg);
     }
 
     double computeKFParallax(Keyframe &KF, Points &currPts)
     {
+        // optional defensive checks
+        if (KF.points.ids.size() != KF.points.pts.size())
+        {
+            ROS_WARN("KF points ids/pts size mismatch");
+        }
+        if (currPts.ids.size() != currPts.pts.size())
+        {
+            ROS_WARN("currPts ids/pts size mismatch");
+        }
+
+        // build fast lookup: id -> index in currPts.pts
+        std::unordered_map<int, int> id_to_idx;
+        id_to_idx.reserve(currPts.ids.size());
+        for (size_t i = 0; i < currPts.ids.size(); ++i)
+        {
+            id_to_idx[currPts.ids[i]] = static_cast<int>(i);
+        }
+
         double sum = 0.0;
         int cnt = 0;
 
-        for (size_t i = 0; i < KF.points.ids.size(); i++)
+        for (size_t i = 0; i < KF.points.ids.size(); ++i)
         {
             int idKF = KF.points.ids[i];
-            auto it = std::find(currPts.ids.begin(), currPts.ids.end(), idKF);
-            if (it == currPts.ids.end())
+            auto it = id_to_idx.find(idKF);
+            if (it == id_to_idx.end())
                 continue;
 
-            int j = std::distance(currPts.ids.begin(), it);
+            int j = it->second;
 
             double dx = currPts.pts[j].x - KF.points.pts[i].x;
             double dy = currPts.pts[j].y - KF.points.pts[i].y;
@@ -763,10 +962,7 @@ private:
             cnt++;
         }
 
-        if (cnt == 0)
-            return 0.0;
-
-        return sum / cnt;
+        return (cnt == 0) ? 0.0 : (sum / cnt);
     }
 
     void buildCorrespondencesById(const Points &ref, const Points &cur,
@@ -825,13 +1021,30 @@ private:
                 continue;
 
             double dt = (tb - ta).toSec();
+            if (dt <= 0.0)
+                continue;
 
-            Eigen::Vector3d v(
+            // Velocity in body frame
+            Eigen::Vector3d v_body(
                 velMsgs[i]->vector.x,
                 velMsgs[i]->vector.y,
                 velMsgs[i]->vector.z);
 
-            dp += v * dt;
+            // Get nearest quaternion
+            auto q = findNearestQuat(velMsgs[i]->header.stamp);
+            if (!q)
+                continue;
+
+            // Convert to Eigen quaternion
+            Eigen::Quaterniond q_wb(
+                q->quaternion.w,
+                q->quaternion.x,
+                q->quaternion.y,
+                q->quaternion.z);
+
+            Eigen::Vector3d v_world = q_wb * v_body;
+
+            dp += v_world * dt;
         }
 
         return dp;

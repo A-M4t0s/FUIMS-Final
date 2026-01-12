@@ -118,15 +118,14 @@ Eigen::Quaterniond convertNEDtoENU(const Eigen::Quaterniond &q_ned)
 {
     Eigen::Matrix3d R_ned_to_enu;
     R_ned_to_enu << 0, 1, 0,
-                    1, 0, 0,
-                    0, 0, -1;
+        1, 0, 0,
+        0, 0, -1;
 
     Eigen::Quaterniond q_tf(R_ned_to_enu);
 
     // Passive frame transformation: q_enu = R * q_ned * R⁻¹
     return q_tf * q_ned * q_tf.inverse();
 }
-
 
 // =========================================================
 // Signal Handling
@@ -187,17 +186,6 @@ public:
             Eigen::Vector3d ned_euler = q_ned.toRotationMatrix().eulerAngles(2, 1, 0); // ZYX: yaw, pitch, roll
             Eigen::Vector3d enu_euler = q_enu.toRotationMatrix().eulerAngles(2, 1, 0);
 
-            ROS_INFO_STREAM_THROTTLE(2.0,
-                                     "[Quat @ " << msg->header.stamp << "]\n"
-                                                << "NED Euler (yaw, pitch, roll) = "
-                                                << ned_euler[0] * 180.0 / M_PI << ", "
-                                                << ned_euler[1] * 180.0 / M_PI << ", "
-                                                << ned_euler[2] * 180.0 / M_PI << "\n"
-                                                << "ENU Euler (yaw, pitch, roll) = "
-                                                << enu_euler[0] * 180.0 / M_PI << ", "
-                                                << enu_euler[1] * 180.0 / M_PI << ", "
-                                                << enu_euler[2] * 180.0 / M_PI);
-
             // Store converted quaternion into quatMsgs
             geometry_msgs::QuaternionStampedPtr newMsg(new geometry_msgs::QuaternionStamped(*msg));
             newMsg->quaternion.w = q_enu.w();
@@ -229,16 +217,7 @@ public:
             velMsgs.push_back(newMsg);
         }
         ROS_INFO("Loaded and converted %zu velocity messages (NED ➝ ENU)", velMsgs.size());
-        if (velMsgs.size() > 0)
-        {
-            const auto &sample = velMsgs.front();
-            ROS_INFO("[Velocity ENU] t=%.3f | x=%.3f, y=%.3f, z=%.3f",
-                     sample->header.stamp.toSec(),
-                     sample->vector.x,
-                     sample->vector.y,
-                     sample->vector.z);
-        }
-
+    
         // GPS: guardar o TEMPO do bag e valores (lat/lon já em radianos neste bag)
         rosbag::View gps_view(bag, rosbag::TopicQuery(GPS_TOPIC));
         for (const rosbag::MessageInstance &m : gps_view)
@@ -285,7 +264,7 @@ public:
                 break;
             }
 
-            ROS_INFO("Processing frame %d", frameIdx);
+            // ROS_INFO("Processing frame %d", frameIdx);
 
             auto imgMsg = m.instantiate<sensor_msgs::CompressedImage>();
             if (!imgMsg)
@@ -339,17 +318,22 @@ public:
                 cv::Size(21, 21),
                 2);
 
-            Points currFiltered;
-            std::vector<cv::Point2f> prevValid, currValid;
-
             auto inImage = [&](const cv::Point2f &p, const cv::Mat &img)
             {
                 return p.x >= 8 && p.y >= 8 && p.x < img.cols - 8 && p.y < img.rows - 8;
             };
+            const float MAX_TRACKING_ERROR = 4.0f;
+
+            Points currFiltered;
+            std::vector<cv::Point2f> prevValid, currValid;
 
             for (size_t k = 0; k < status.size(); k++)
             {
                 if (!status[k])
+                    continue;
+
+                // Skip features with high LK error
+                if (error[k] > MAX_TRACKING_ERROR)
                     continue;
 
                 const cv::Point2f &p_prev = prevPoints.pts[k];
@@ -358,7 +342,7 @@ public:
                 if (!inImage(p_prev, prevUndistortedGrey) || !inImage(p_curr, currUndistortedGrey))
                     continue;
 
-                if (cv::norm(p_curr - p_prev) > 60.0f)
+                if (cv::norm(p_curr - p_prev) > 60.0f) // optional outlier rejection
                     continue;
 
                 prevValid.push_back(p_prev);
@@ -367,11 +351,10 @@ public:
                 currFiltered.pts.push_back(p_curr);
                 currFiltered.ids.push_back(prevPoints.ids[k]);
             }
-
             currPoints = currFiltered;
             Points trackedOnly = currPoints; // before replenish
 
-            if (currPoints.pts.size() < KF_FEATURE_THRESHOLD)
+            if (currPoints.pts.size() < 250)
             {
                 ROS_WARN("[Frame %d] Replenishing features. Current count: %zu",
                          frameIdx, currPoints.pts.size());
@@ -394,7 +377,7 @@ public:
                 if (trackedOnly.pts.size() >= 15)
                     kfParallax = computeKFParallax(lastKF, trackedOnly);
 
-                ROS_INFO("KF Parallax = %.2f", kfParallax);
+                // ROS_INFO("KF Parallax = %.2f", kfParallax);
 
                 if (kfParallax > KF_PARALLAX_THRESHOLD)
                     isKeyframe = true;
@@ -508,7 +491,7 @@ public:
                     lastKF.timestamp = t_kf;
 
                     // Add GPS prior every N keyframes
-                    const int GPS_PRIOR_INTERVAL = 10;
+                    const int GPS_PRIOR_INTERVAL = 20;
                     if (kfIndex % GPS_PRIOR_INTERVAL == 0)
                     {
                         // Find nearest GPS to this keyframe time
@@ -543,7 +526,7 @@ public:
 
                         // Noise: loose on rotation (effectively unconstrained), tighter on position
                         auto gpsNoise = gtsam::noiseModel::Diagonal::Sigmas(
-                            (gtsam::Vector(6) << 1e6, 1e6, 1e6, 0.05, 0.05, 3.0).finished());
+                            (gtsam::Vector(6) << 1e6, 1e6, 1e6, 0.05, 0.05, 0.05).finished());
 
                         // Add GPS prior
                         graph.add(gtsam::PriorFactor<gtsam::Pose3>(
@@ -559,32 +542,32 @@ public:
             // =========================================================
             // Debug publish (inside loop)
             // =========================================================
-            // if (!prevUndistortedGrey.empty() && !currUndistortedGrey.empty())
-            // {
-            //     cv::Mat prevBgr, currBgr;
-            //     cv::cvtColor(prevUndistortedGrey, prevBgr, cv::COLOR_GRAY2BGR);
-            //     cv::cvtColor(currUndistortedGrey, currBgr, cv::COLOR_GRAY2BGR);
+            if (!prevUndistortedGrey.empty() && !currUndistortedGrey.empty())
+            {
+                cv::Mat prevBgr, currBgr;
+                cv::cvtColor(prevUndistortedGrey, prevBgr, cv::COLOR_GRAY2BGR);
+                cv::cvtColor(currUndistortedGrey, currBgr, cv::COLOR_GRAY2BGR);
 
-            //     cv::Mat debugImg;
-            //     cv::hconcat(prevBgr, currBgr, debugImg);
+                cv::Mat debugImg;
+                cv::hconcat(prevBgr, currBgr, debugImg);
 
-            //     int offsetX = prevBgr.cols;
-            //     for (size_t k = 0; k < prevValid.size(); k++)
-            //     {
-            //         cv::Point2f p1 = prevValid[k];
-            //         cv::Point2f p2 = currValid[k] + cv::Point2f((float)offsetX, 0.0f);
+                int offsetX = prevBgr.cols;
+                for (size_t k = 0; k < prevValid.size(); k++)
+                {
+                    cv::Point2f p1 = prevValid[k];
+                    cv::Point2f p2 = currValid[k] + cv::Point2f((float)offsetX, 0.0f);
 
-            //         cv::circle(debugImg, p1, 3, cv::Scalar(0, 255, 0), -1);
-            //         cv::circle(debugImg, p2, 3, cv::Scalar(0, 0, 255), -1);
-            //         cv::line(debugImg, p1, p2, cv::Scalar(255, 0, 0), 1);
-            //     }
+                    cv::circle(debugImg, p1, 3, cv::Scalar(0, 255, 0), -1);
+                    cv::circle(debugImg, p2, 3, cv::Scalar(0, 0, 255), -1);
+                    cv::line(debugImg, p1, p2, cv::Scalar(255, 0, 0), 1);
+                }
 
-            //     sensor_msgs::ImagePtr debugMsg =
-            //         cv_bridge::CvImage(std_msgs::Header(), "bgr8", debugImg).toImageMsg();
+                sensor_msgs::ImagePtr debugMsg =
+                    cv_bridge::CvImage(std_msgs::Header(), "bgr8", debugImg).toImageMsg();
 
-            //     debugMsg->header.stamp = m.getTime();
-            //     debugPub.publish(debugMsg);
-            // }
+                debugMsg->header.stamp = m.getTime();
+                debugPub.publish(debugMsg);
+            }
 
             // Next iteration
             prevUndistortedGrey = currUndistortedGrey.clone();
@@ -803,7 +786,7 @@ private:
                   { return kp[a].response > kp[b].response; });
 
         cv::Mat mask(img.size(), CV_8UC1, cv::Scalar(255));
-        int radius = 21;
+        int radius = 27;
 
         int kept = 0;
         for (int id : idx)
