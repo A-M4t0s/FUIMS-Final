@@ -21,6 +21,7 @@ find_package(catkin REQUIRED COMPONENTS
   tf2_msgs
   cv_bridge
   image_transport
+  message_generation
 )
 
 ## System dependencies are found with CMake's conventions
@@ -59,11 +60,10 @@ find_package(GTSAM REQUIRED)
 ##   * add every package in MSG_DEP_SET to generate_messages(DEPENDENCIES ...)
 
 ## Generate messages in the 'msg' folder
-# add_message_files(
-#   FILES
-#   Message1.msg
-#   Message2.msg
-# )
+add_message_files(
+  FILES
+  Float64Stamped.msg
+)
 
 ## Generate services in the 'srv' folder
 # add_service_files(
@@ -80,10 +80,10 @@ find_package(GTSAM REQUIRED)
 # )
 
 ## Generate added messages and services with any dependencies listed here
-# generate_messages(
-#   DEPENDENCIES
-#   std_msgs  # Or other packages containing msgs
-# )
+generate_messages(
+  DEPENDENCIES
+  std_msgs  # Or other packages containing msgs
+)
 
 ################################################
 ## Declare ROS dynamic reconfigure parameters ##
@@ -127,6 +127,7 @@ catkin_package(
     tf2_ros
     cv_bridge
     image_transport
+    message_runtime
   DEPENDS OpenCV
 )
 
@@ -159,6 +160,7 @@ include_directories(
 # add_executable(${PROJECT_NAME}_node src/fuims_node.cpp)
 add_executable(fuims_final src/fuims_vio_v2.cpp)
 add_executable(fuims_tester src/fuims_vio_v4.cpp)
+add_executable(fuims_V2 src/fuims_vio_v6.cpp)
 add_executable(bag_updater src/rosbag_correction.cpp)
 
 ## Rename C++ executable without prefix
@@ -172,6 +174,7 @@ add_executable(bag_updater src/rosbag_correction.cpp)
 # add_dependencies(${PROJECT_NAME}_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 add_dependencies(fuims_final ${catkin_EXPORTED_TARGETS})
 add_dependencies(fuims_tester ${catkin_EXPORTED_TARGETS})
+add_dependencies(fuims_V2 ${catkin_EXPORTED_TARGETS})
 add_dependencies(bag_updater ${catkin_EXPORTED_TARGETS})
 
 ## Specify libraries to link a library or executable target against
@@ -185,6 +188,12 @@ target_link_libraries(fuims_final
 )
 
 target_link_libraries(fuims_tester
+  ${catkin_LIBRARIES}
+  ${OpenCV_LIBS}
+  gtsam
+)
+
+target_link_libraries(fuims_V2
   ${catkin_LIBRARIES}
   ${OpenCV_LIBS}
   gtsam
@@ -219,6 +228,10 @@ install(TARGETS fuims_final
 )
 
 install(TARGETS fuims_tester
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(TARGETS fuims_V2
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

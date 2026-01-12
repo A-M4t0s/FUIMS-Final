@@ -660,7 +660,7 @@ public:
             gtsam::Point3 gps_point(enu.x, enu.y, enu.z);
 
             auto posNoise = gtsam::noiseModel::Diagonal::Sigmas(
-                (gtsam::Vector(3) << 0.1, 0.1, 0.1).finished());
+                (gtsam::Vector(3) << 5.0, 5.0, 0.1).finished());
 
             // Add GPS prior (on translation only)
             graph.add(gtsam::PoseTranslationPrior<gtsam::Pose3>(

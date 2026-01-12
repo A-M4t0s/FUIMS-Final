@@ -3,6 +3,7 @@
 #include <rosbag/view.h>
 
 #include <std_msgs/Float64.h>
+#include <fuims/Float64Stamped.h>
 #include <sensor_msgs/CompressedImage.h>
 #include <sensor_msgs/NavSatFix.h>
 #include <geometry_msgs/QuaternionStamped.h>
@@ -38,55 +39,89 @@ public:
         {
             ros::Time t = m.getTime();
 
-            // CAMERA (CompressedImage)
+            // ===============================
+            // CAMERA
+            // ===============================
             if (m.getTopic() == CAMERA_TOPIC)
             {
-                sensor_msgs::CompressedImageConstPtr img =
-                    m.instantiate<sensor_msgs::CompressedImage>();
+                auto img = m.instantiate<sensor_msgs::CompressedImage>();
+                if (!img)
+                    continue;
 
-                if (img)
-                    output.write(CAMERA_TOPIC, t, *img);
+                sensor_msgs::CompressedImage out = *img;
+                out.header.stamp = t;
+                out.header.frame_id = "dji_m350";
 
+                output.write(CAMERA_TOPIC, t, out);
                 continue;
             }
 
+            // ===============================
             // QUATERNION
+            // ===============================
             if (m.getTopic() == QUATERNION_TOPIC)
             {
                 auto q = m.instantiate<geometry_msgs::QuaternionStamped>();
-                if (q)
-                    output.write(QUATERNION_TOPIC, t, *q);
+                if (!q)
+                    continue;
 
+                geometry_msgs::QuaternionStamped out = *q;
+                out.header.stamp = t;
+                out.header.frame_id = "dji_m350";
+
+                output.write(QUATERNION_TOPIC, t, out);
                 continue;
             }
 
+            // ===============================
             // VELOCITY
+            // ===============================
             if (m.getTopic() == VELOCITY_TOPIC)
             {
                 auto v = m.instantiate<geometry_msgs::Vector3Stamped>();
-                if (v)
-                    output.write(VELOCITY_TOPIC, t, *v);
+                if (!v)
+                    continue;
 
+                geometry_msgs::Vector3Stamped out = *v;
+                out.header.stamp = t;
+                out.header.frame_id = "dji_m350";
+
+                output.write(VELOCITY_TOPIC, t, out);
                 continue;
             }
 
-            // ALTITUDE
+            // ===============================
+            // ALTITUDE (Float64 → Float64Stamped)
+            // ===============================
             if (m.getTopic() == ALTITUDE_TOPIC)
             {
                 auto alt = m.instantiate<std_msgs::Float64>();
-                if (alt)
-                    output.write(ALTITUDE_TOPIC, t, *alt);
+                if (!alt)
+                    continue;
 
+                fuims::Float64Stamped out;
+                out.header.stamp = t;
+                out.header.frame_id = "dji_m350";
+                out.data = alt->data;
+
+                output.write(ALTITUDE_TOPIC, t, out);
                 continue;
             }
 
+            // ===============================
             // GPS
+            // ===============================
             if (m.getTopic() == GPS_TOPIC)
             {
                 auto gps = m.instantiate<sensor_msgs::NavSatFix>();
-                if (gps)
-                    output.write(GPS_TOPIC, t, *gps);
+                if (!gps)
+                    continue;
 
+                sensor_msgs::NavSatFix out = *gps;
+                out.header.stamp = t;
+                out.header.frame_id = "dji_m350";
+
+                output.write(GPS_TOPIC, t, out);
                 continue;
             }
         }

@@ -1,0 +1,3 @@
+<launch>
+    <node name="fuims_vio" pkg="fuims" type="fuims_V2" output="screen"/>
+</launch>
