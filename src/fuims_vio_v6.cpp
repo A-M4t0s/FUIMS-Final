@@ -122,8 +122,10 @@ struct Points
  */
 struct Keyframe
 {
+  int index;
   ros::Time timestamp;
   cv::Mat image;
+  int frameID;
   Points points;
   gtsam::Pose3 pose;
 };
@@ -204,11 +206,15 @@ public:
         else
         {
           // Feature Detection + Feature Tracking
-          bool success = frameProcessing();
+          bool frameSuccess = frameProcessing();
 
-          
+          // Keyframe Processing Function
+          bool keyframeSuccess = keyframeProcessing();
 
-          if (success)
+          // Estimation Function
+          // bool estimateSuccess = poseEstimation();
+
+          if (frameSuccess)
           {
             // [DEBUG] - Feature Ages Image Publisher
             debugImageFeatureAges();
@@ -287,12 +293,17 @@ private:
   // Status variables
   vioState vio_state_ = vioState::IDLE;
   bool isFirstFrame = true;
+  bool hasFirstKF = false;
   int frameIdx = 0;
+  int keyframeIdx = 0;
 
   // VO-Related Variables
   ImageFrame currFrame, prevFrame;
-  Points currPoints, prevPoints;
+  Points currPoints, prevPoints, trackedPoints;
   int nextFeatureID = 0;
+
+  // Keyframes
+  Keyframe prevKeyframe, currKeyframe;
 
   // =========================================================
   // Helpers
@@ -392,7 +403,9 @@ private:
   void statesReset()
   {
     isFirstFrame = true;
+    hasFirstKF = false;
     frameIdx = 0;
+    keyframeIdx = 0;
   }
 
   /**
@@ -700,7 +713,7 @@ private:
       currPoints.pts.push_back(pt);
       currPoints.ids.push_back(nextFeatureID++);
       currPoints.isTracked.push_back(false); // Not yet tracked
-      currPoints.age.push_back(1);           // New feature
+      currPoints.age.push_back(0);           // New feature
 
       featuresToAdd--;
       if (featuresToAdd <= 0)
@@ -739,6 +752,127 @@ private:
 
     // Feature Replenishing to maxFeatures
     replenishFeatures(currFrame.image);
+
+    return true;
+  }
+
+  double computeParallax(Points kfPoints, Points framePoints)
+  {
+    // Defensive Checks
+    if (kfPoints.ids.size() != kfPoints.pts.size())
+    {
+      WARN("KF points ids/pts size mismatch");
+      return 0.0;
+    }
+    if (framePoints.ids.size() != framePoints.pts.size())
+    {
+      WARN("framePoints ids/pts size mismatch");
+      return 0.0;
+    }
+
+    // Auxillary variables
+    int cnt = 0;
+    double sum = 0.0;
+
+    // Build fast LUT
+    std::unordered_map<int, int>
+        id_to_idx;
+    id_to_idx.reserve(framePoints.ids.size());
+    for (size_t i = 0; i < framePoints.ids.size(); ++i)
+    {
+      id_to_idx[framePoints.ids[i]] = static_cast<int>(i);
+    }
+
+    // Cycling through the KF Points
+    for (size_t i = 0; i < kfPoints.ids.size(); i++)
+    {
+      int kfID = kfPoints.ids[i];
+      auto it = id_to_idx.find(kfID);
+      if (it == id_to_idx.end())
+        continue;
+
+      int j = it->second;
+
+      // Diference between x and y pixels
+      double dx = framePoints.pts[j].x - kfPoints.pts[i].x;
+      double dy = framePoints.pts[j].y - kfPoints.pts[i].y;
+
+      // Euclidean Distance
+      sum += std::sqrt(dx * dx + dy * dy);
+      cnt++;
+    }
+
+    return (cnt == 0) ? 0.0 : (sum / cnt);
+  }
+
+  /**
+   *
+   */
+  bool keyframeProcessing()
+  {
+    // Clear last trackedPoints
+    trackedPoints.pts.clear();
+    trackedPoints.ids.clear();
+
+    // Filtering features by their age
+    for (size_t i = 0; i < currPoints.pts.size(); i++)
+    {
+      if (currPoints.age[i] >= MAX_TRACKING_AGE)
+      {
+        trackedPoints.pts.push_back(currPoints.pts[i]);
+        trackedPoints.ids.push_back(currPoints.ids[i]);
+      }
+    }
+
+    // Keyframe Decision
+    bool isKeyframe = false;
+    if (!hasFirstKF && trackedPoints.pts.size() >= MIN_TRACKED_FEATURES) // First Keyframe
+    {
+      isKeyframe = true;
+    }
+    else if (hasFirstKF && trackedPoints.pts.size() >= MIN_TRACKED_FEATURES) // Subsequent Keyframes
+    {
+      // Calculate parallax between current frame Points and last keyframe Points
+      double kfParallax = computeParallax(currKeyframe.points, trackedPoints);
+
+      // Verifying Keyframe creation conditions (Parallax and Feature)
+      if (kfParallax > KF_PARALLAX_THRESHOLD)
+        isKeyframe = true;
+      if (trackedPoints.pts.size() < KF_FEATURE_THRESHOLD)
+        isKeyframe = true;
+    }
+
+    // Keyframe creation
+    if (isKeyframe)
+    {
+      OK("[Frame " << frameIdx << "] New Keyframe created with "
+                   << trackedPoints.pts.size() << " features. ");
+      const ros::Time kfTime = currFrame.timestamp;
+
+      if (!hasFirstKF) // First Keyframe Initialization
+      {
+        // Fill Keyframe structure
+        currKeyframe.index = keyframeIdx++;
+        currKeyframe.frameID = frameIdx;
+        currKeyframe.image = currFrame.image.clone();
+        currKeyframe.points = trackedPoints;
+        currKeyframe.timestamp = kfTime;
+
+        hasFirstKF = true;
+      }
+      else // Subsequent Keyframes
+      {
+        // Update Previous Keyframe Data
+        prevKeyframe = currKeyframe;
+
+        // Fill Keyframe structure
+        currKeyframe.index = keyframeIdx++;
+        currKeyframe.frameID = frameIdx;
+        currKeyframe.image = currFrame.image.clone();
+        currKeyframe.points = trackedPoints;
+        currKeyframe.timestamp = kfTime;
+      }
+    }
 
     return true;
   }
