@@ -130,6 +130,31 @@ struct Keyframe
   gtsam::Pose3 pose;
 };
 
+/**
+ * @brief ENU Referential Data Structure
+ * @param timestam ROS Time Stamp
+ * @param x coordinate in the ENU frame (double)
+ * @param y coordinate in the ENU frame (double)
+ * @param z coordinate in the ENU frame (double)
+ * @return ENU structure
+ */
+struct ENU
+{
+  ros::Time timestamp;
+  double x, y, z;
+};
+
+/**
+ *  @brief Altitude (Barometer) data structure
+ *  @param timestamp
+ *  @param altitude
+ */
+struct BaroAltitude
+{
+  ros::Time timestamp;
+  double altitude;
+};
+
 // =========================================================
 // Signal Handling
 // =========================================================
@@ -142,6 +167,62 @@ void signalHandler(int sig)
     g_requestShutdown = 1;
     ROS_WARN("SIGINT received. Shutting down VIO.");
   }
+}
+
+// =========================================================
+//  WGS84 Constants
+// =========================================================
+constexpr double a = 6378137.0;
+constexpr double f = 1.0 / 298.257223563;
+constexpr double b = a * (1 - f);
+constexpr double e2 = 1 - (b * b) / (a * a);
+
+// =========================================================
+// Referential Coordinate Conversion Functions
+// =========================================================
+void geodeticToECEF(double lat, double lon, double alt, double &X, double &Y, double &Z)
+{
+  double sinLat = sin(lat), cosLat = cos(lat);
+  double sinLon = sin(lon), cosLon = cos(lon);
+
+  double N = a / sqrt(1 - e2 * sinLat * sinLat);
+
+  X = (N + alt) * cosLat * cosLon;
+  Y = (N + alt) * cosLat * sinLon;
+  Z = (b * b / (a * a) * N + alt) * sinLat;
+}
+
+ENU ecefToENU(double X, double Y, double Z, double lat0, double lon0, double alt0)
+{
+  double X0, Y0, Z0;
+  geodeticToECEF(lat0, lon0, alt0, X0, Y0, Z0);
+
+  double dx = X - X0;
+  double dy = Y - Y0;
+  double dz = Z - Z0;
+
+  double sinLat = sin(lat0), cosLat = cos(lat0);
+  double sinLon = sin(lon0), cosLon = cos(lon0);
+
+  ENU enu;
+  enu.x = -sinLon * dx + cosLon * dy;
+  enu.y = -cosLon * sinLat * dx - sinLon * sinLat * dy + cosLat * dz;
+  enu.z = cosLon * cosLat * dx + sinLon * cosLat * dy + sinLat * dz;
+
+  return enu;
+}
+
+Eigen::Quaterniond convertNEDtoENU(const Eigen::Quaterniond &q_ned)
+{
+  Eigen::Matrix3d R_ned_to_enu;
+  R_ned_to_enu << 0, 1, 0,
+      1, 0, 0,
+      0, 0, -1;
+
+  Eigen::Quaterniond q_tf(R_ned_to_enu);
+
+  // Passive frame transformation: q_enu = R * q_ned * R⁻¹
+  return q_tf * q_ned * q_tf.inverse();
 }
 
 // =========================================================
@@ -171,10 +252,14 @@ public:
     // Initializing ROS Publishers
     matchingPub = nh.advertise<sensor_msgs::Image>("vio/feature_matches", 1);
     featurePub = nh.advertise<sensor_msgs::Image>("vio/feature_ages", 1);
+    posePub = nh.advertise<geometry_msgs::PoseStamped>("vio/pose", 1);
+    pathPub = nh.advertise<nav_msgs::Path>("vio/path", 1);
+    gtPathPub = nh.advertise<nav_msgs::Path>("vio/ground_truth", 1, true);
 
     // Initializing ROS Subscribers
     stateSub = nh.subscribe<std_msgs::UInt8>("vio/state", 1, &vioManager::stateCallback, this);
 
+    // Mapping images for faster undistorting
     cv::initUndistortRectifyMap(
         K,                    // Intrinsic matrix
         distCoeffs,           // Distortion coefficients
@@ -184,6 +269,25 @@ public:
         CV_16SC2,             // Output map format
         map1, map2            // Output maps
     );
+
+    // Publishing the Ground Truth
+    nav_msgs::Path gtPath;
+    gtPath.header.frame_id = "map";
+
+    for (const auto &gps : gpsEnuBuffer)
+    {
+      geometry_msgs::PoseStamped pose;
+      pose.header.stamp = gps.timestamp;
+      pose.header.frame_id = "map";
+      pose.pose.position.x = gps.x;
+      pose.pose.position.y = gps.y;
+      pose.pose.position.z = gps.z;
+      pose.pose.orientation.w = 1.0;
+
+      gtPath.poses.push_back(pose);
+    }
+    gtPathPub.publish(gtPath);
+    ROS_INFO_STREAM(GREEN << "Published ground truth path with " << gtPath.poses.size() << " poses" << CLEAR);
 
     // =========================================================
     // Processing Loop
@@ -280,8 +384,16 @@ private:
   // ROS Topic Messages Buffers
   std::deque<sensor_msgs::CompressedImageConstPtr> imgBuffer;
   std::deque<sensor_msgs::NavSatFixConstPtr> gpsBuffer;
+  std::deque<ENU> gpsEnuBuffer;
+  std::deque<BaroAltitude> altBuffer;
   std::deque<geometry_msgs::Vector3StampedConstPtr> velBuffer;
   std::deque<geometry_msgs::QuaternionStampedConstPtr> quatBuffer;
+
+  // ENU Origin Reference
+  bool enuOriginInitialized = false;
+  double lat0_rad = 0.0;
+  double lon0_rad = 0.0;
+  double alt0 = 0.0;
 
   // Camera Parameters
   const cv::Mat K = (cv::Mat_<double>(3, 3) << 1372.76165, 0.0, 960.45289,
@@ -348,12 +460,20 @@ private:
    * @brief ROSBAG Buffer Messages
    * @param bag_path  Path to the desired ROSBAG to be processed
    * @return void
+   *
+   * This helper function reads the ROSBAG content and processes the information.
+   * The camera messages are all placed on a buffer for posterior processing
+   * The inertial messages (quaternion, velocity and gps) are processed in order to convert their referential
+   * to the ENU frame.
+   *
+   * GPS: WGS-84 -> ENU
+   * Velocity: NEU -> ENU
+   * Quaternion: NED -> ENU
    */
   void bufferRosbagMessages(const std::string &bag_path)
   {
     rosbag::Bag bag;
     bag.open(bag_path, rosbag::bagmode::Read);
-    bool firstImage = true;
 
     std::vector<std::string> topics = {
         CAMERA_TOPIC,
@@ -365,39 +485,108 @@ private:
 
     for (const rosbag::MessageInstance &m : view)
     {
+      /* ================= CAMERA ================= */
       if (m.getTopic() == CAMERA_TOPIC)
       {
         auto img = m.instantiate<sensor_msgs::CompressedImage>();
         if (img)
           imgBuffer.push_back(img);
       }
+
+      /* ================= GPS (WGS-84) ================= */
       else if (m.getTopic() == GPS_TOPIC)
       {
         auto gps = m.instantiate<sensor_msgs::NavSatFix>();
-        if (gps)
-          gpsBuffer.push_back(gps);
+        if (!gps)
+          continue;
+
+        // Convert degrees to radians
+        double lat_rad = gps->latitude * M_PI / 180.0;
+        double lon_rad = gps->longitude * M_PI / 180.0;
+        double alt = gps->altitude;
+
+        // Initialize ENU origin at first GPS fix
+        if (!enuOriginInitialized)
+        {
+          lat0_rad = lat_rad;
+          lon0_rad = lon_rad;
+          alt0 = alt;
+          enuOriginInitialized = true;
+        }
+
+        // WGS-84 → ECEF
+        double X, Y, Z;
+        geodeticToECEF(lat_rad, lon_rad, alt, X, Y, Z);
+
+        // ECEF → ENU
+        ENU enu = ecefToENU(X, Y, Z, lat0_rad, lon0_rad, alt0);
+        enu.timestamp = gps->header.stamp;
+
+        gpsEnuBuffer.push_back(enu);
+
+        // Store altitude independently (baro / fused altitude)
+        BaroAltitude baro;
+        baro.timestamp = gps->header.stamp;
+        baro.altitude = alt;
+        altBuffer.push_back(baro);
       }
+
+      /* ================= VELOCITY: NEU → ENU ================= */
       else if (m.getTopic() == VELOCITY_TOPIC)
       {
         auto vel = m.instantiate<geometry_msgs::Vector3Stamped>();
-        if (vel)
-          velBuffer.push_back(vel);
+        if (!vel)
+          continue;
+
+        geometry_msgs::Vector3StampedPtr enuVel(
+            new geometry_msgs::Vector3Stamped(*vel));
+
+        // DJI publishes NEU: (North, East, Up)
+        // Convert to ENU: (East, North, Up)
+        enuVel->header = vel->header;
+        enuVel->vector.x = vel->vector.y; // East
+        enuVel->vector.y = vel->vector.x; // North
+        enuVel->vector.z = vel->vector.z; // Up (NO sign flip)
+
+        velBuffer.push_back(enuVel);
       }
+
+      /* ================= QUATERNION: NED → ENU ================= */
       else if (m.getTopic() == QUATERNION_TOPIC)
       {
         auto quat = m.instantiate<geometry_msgs::QuaternionStamped>();
-        if (quat)
-          quatBuffer.push_back(quat);
+        if (!quat)
+          continue;
+
+        Eigen::Quaterniond q_ned(
+            quat->quaternion.w,
+            quat->quaternion.x,
+            quat->quaternion.y,
+            quat->quaternion.z);
+
+        Eigen::Quaterniond q_enu = convertNEDtoENU(q_ned);
+
+        geometry_msgs::QuaternionStampedPtr enuQuat(
+            new geometry_msgs::QuaternionStamped(*quat));
+
+        enuQuat->header = quat->header;
+        enuQuat->quaternion.w = q_enu.w();
+        enuQuat->quaternion.x = q_enu.x();
+        enuQuat->quaternion.y = q_enu.y();
+        enuQuat->quaternion.z = q_enu.z();
+
+        quatBuffer.push_back(enuQuat);
       }
     }
 
-    INFO("ROSBAG Messages Processed");
-    OK("Image messages total: " << imgBuffer.size());
-    OK("Quaternion messages total: " << quatBuffer.size());
-    OK("Velocity messages total: " << velBuffer.size());
-    OK("GPS messages total: " << gpsBuffer.size());
-
     bag.close();
+
+    INFO("ROSBAG Messages Processed (ENU)");
+    OK("Image messages total: " << imgBuffer.size());
+    OK("Quaternion ENU messages total: " << quatBuffer.size());
+    OK("Velocity ENU messages total: " << velBuffer.size());
+    OK("GPS ENU messages total: " << gpsEnuBuffer.size());
+    OK("Altitude (Baro) messages total: " << altBuffer.size());
   }
 
   void statesReset()
@@ -648,7 +837,7 @@ private:
         status,
         error,
         cv::Size(21, 21),
-        2);
+        KLT_MAX_LEVEL);
 
     // Results Processing
     for (size_t i = 0; i < status.size(); i++)
@@ -874,6 +1063,11 @@ private:
       }
     }
 
+    return true;
+  }
+
+  bool poseEstimation()
+  {
     return true;
   }
 };
