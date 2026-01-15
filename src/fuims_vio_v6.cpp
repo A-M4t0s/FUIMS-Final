@@ -31,6 +31,7 @@
 #include <gtsam/geometry/Point3.h>
 #include <gtsam/navigation/GPSFactor.h>
 
+#include <opencv2/core/eigen.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
@@ -270,6 +271,25 @@ public:
         map1, map2            // Output maps
     );
 
+    // Initializing GTSAM
+    // ====== ISAM2 Setup ======
+    gtsam::ISAM2Params params;
+    params.relinearizeThreshold = 0.1;
+    params.relinearizeSkip = 1;
+    isam = gtsam::ISAM2(params);
+
+    // ====== Prior ======
+    gtsam::Pose3 prior;
+    auto priorNoise = gtsam::noiseModel::Diagonal::Sigmas(
+        (gtsam::Vector(6) << 0.1, 0.1, 0.1, 0.1, 0.1, 0.1).finished());
+
+    graph.add(gtsam::PriorFactor<gtsam::Pose3>(gtsam::Symbol('x', 0), prior, priorNoise));
+    values.insert(gtsam::Symbol('x', 0), prior);
+
+    isam.update(graph, values);
+    graph.resize(0);
+    values.clear();
+
     // Publishing the Ground Truth
     nav_msgs::Path gtPath;
     gtPath.header.frame_id = "map";
@@ -316,7 +336,7 @@ public:
           bool keyframeSuccess = keyframeProcessing();
 
           // Estimation Function
-          // bool estimateSuccess = poseEstimation();
+          bool estimateSuccess = poseEstimation();
 
           if (frameSuccess)
           {
@@ -341,6 +361,9 @@ public:
         break;
 
       default:
+        ERROR("[VIO Manager] State Machine is Broken!!");
+        ERROR("[VIO Manager] Terminating process!!");
+        g_requestShutdown = true;
         break;
       }
 
@@ -381,6 +404,9 @@ private:
   // === ROS Topic Message Rates ===
   int CAMERA_RATE, INERTIAL_RATE;
 
+  // VO and Inertial Prior Noise (dynamic reconfigurable)
+  double VO_NOISE_ROT, VO_NOISE_TRANS, ROT_PRIOR_NOISE, TRANS_PRIOR_NOISE, ALT_PRIOR_NOISE, GPS_NOISE;
+
   // ROS Topic Messages Buffers
   std::deque<sensor_msgs::CompressedImageConstPtr> imgBuffer;
   std::deque<sensor_msgs::NavSatFixConstPtr> gpsBuffer;
@@ -416,6 +442,11 @@ private:
 
   // Keyframes
   Keyframe prevKeyframe, currKeyframe;
+
+  // GTSAM related
+  gtsam::ISAM2 isam;
+  gtsam::NonlinearFactorGraph graph;
+  gtsam::Values values;
 
   // =========================================================
   // Helpers
@@ -454,6 +485,14 @@ private:
     // === ROS Topic Message Rates ===
     nh.param("CAMERA_RATE", CAMERA_RATE, 15);
     nh.param("INERTIAL_RATE", INERTIAL_RATE, 30);
+
+    // === GTSAM Noise Values ===
+    nh.param("VO_NOISE_ROT", VO_NOISE_ROT, 0.2);
+    nh.param("VO_NOISE_TRANS", VO_NOISE_TRANS, 0.5);
+    nh.param("ROT_PRIOR_NOISE", ROT_PRIOR_NOISE, 0.05);
+    nh.param("TRANS_PRIOR_NOISE", TRANS_PRIOR_NOISE, 0.1);
+    nh.param("ALT_PRIOR_NOISE", ALT_PRIOR_NOISE, 0.5);
+    nh.param("GPS_NOISE", GPS_NOISE, 1.0);
   }
 
   /**
@@ -595,6 +634,8 @@ private:
     hasFirstKF = false;
     frameIdx = 0;
     keyframeIdx = 0;
+    currKeyframe = Keyframe();
+    prevKeyframe = Keyframe();
   }
 
   /**
@@ -712,6 +753,12 @@ private:
     KLT_FB_THRESH_PX = config.KLT_FB_THRESH_PX;
     CAMERA_RATE = config.CAMERA_RATE;
     INERTIAL_RATE = config.INERTIAL_RATE;
+    VO_NOISE_ROT = config.VO_NOISE_ROT;
+    VO_NOISE_TRANS = config.VO_NOISE_TRANS;
+    ROT_PRIOR_NOISE = config.ROT_PRIOR_NOISE;
+    TRANS_PRIOR_NOISE = config.TRANS_PRIOR_NOISE;
+    ALT_PRIOR_NOISE = config.ALT_PRIOR_NOISE;
+
     INFO("Dynamic reconfigure updated VIO parameters.");
     WARN("Changing VIO State to RESET");
     vio_state_ = vioState::RESET;
@@ -1066,8 +1113,315 @@ private:
     return true;
   }
 
+  /**
+   *
+   */
+  Eigen::Quaterniond getInterpolatedQuat(ros::Time time)
+  {
+    if (quatBuffer.size() < 2)
+    {
+      ROS_WARN("Quaternion buffer too small, returning identity.");
+      return Eigen::Quaterniond::Identity();
+    }
+
+    // Try to interpolate between two surrounding quaternions
+    for (size_t i = 1; i < quatBuffer.size(); ++i)
+    {
+      auto prev = quatBuffer[i - 1];
+      auto next = quatBuffer[i];
+
+      if (prev->header.stamp <= time && next->header.stamp >= time)
+      {
+        double t = (time - prev->header.stamp).toSec() /
+                   (next->header.stamp - prev->header.stamp).toSec();
+
+        Eigen::Quaterniond q1(
+            prev->quaternion.w, prev->quaternion.x,
+            prev->quaternion.y, prev->quaternion.z);
+
+        Eigen::Quaterniond q2(
+            next->quaternion.w, next->quaternion.x,
+            next->quaternion.y, next->quaternion.z);
+
+        return q1.slerp(t, q2); // SLERP
+      }
+    }
+
+    // Fallback: use the closest available quaternion
+    auto closest = quatBuffer[0];
+    double minTimeDiff = std::abs((closest->header.stamp - time).toSec());
+
+    for (size_t i = 1; i < quatBuffer.size(); ++i)
+    {
+      double timeDiff = std::abs((quatBuffer[i]->header.stamp - time).toSec());
+      if (timeDiff < minTimeDiff)
+      {
+        minTimeDiff = timeDiff;
+        closest = quatBuffer[i];
+
+        // Early return on perfect match
+        if (timeDiff == 0.0)
+        {
+          return Eigen::Quaterniond(closest->quaternion.w, closest->quaternion.x,
+                                    closest->quaternion.y, closest->quaternion.z);
+        }
+      }
+    }
+
+    // Return the closest quaternion
+    return Eigen::Quaterniond(closest->quaternion.w, closest->quaternion.x,
+                              closest->quaternion.y, closest->quaternion.z);
+  }
+
+  /**
+   *
+   */
+  Eigen::Vector3d getAverageVelocity(ros::Time t0, ros::Time t1)
+  {
+    Eigen::Vector3d sum(0, 0, 0);
+    int count = 0;
+
+    for (const auto &vel : velBuffer)
+    {
+      if (vel->header.stamp >= t0 && vel->header.stamp <= t1)
+      {
+        sum += Eigen::Vector3d(
+            vel->vector.x,
+            vel->vector.y,
+            vel->vector.z);
+        ++count;
+      }
+    }
+
+    if (count == 0)
+      return Eigen::Vector3d::Zero();
+
+    return sum / count;
+  }
+
+  /**
+   *
+   */
+  double getAverageAltitude(ros::Time t0, ros::Time t1)
+  {
+    double sum = 0.0;
+    int count = 0;
+
+    for (const auto &baro : altBuffer)
+    {
+      if (baro.timestamp >= t0 && baro.timestamp <= t1)
+      {
+        sum += baro.altitude;
+        ++count;
+      }
+    }
+
+    if (count == 0)
+      return 0.0;
+
+    return sum / count;
+  }
+
+  /**
+   *
+   */
+  gtsam::Pose3 voEstimation()
+  {
+    // Aux Variables
+    std::vector<cv::Point2f> prevKFPoints, currKFPoints;
+
+    // Establish keyframe point correspondences (by ID)
+    for (size_t i = 0; i < prevKeyframe.points.ids.size(); i++)
+    {
+      int id = prevKeyframe.points.ids[i];
+      auto it = std::find(currKeyframe.points.ids.begin(), currKeyframe.points.ids.end(), id);
+      if (it == currKeyframe.points.ids.end())
+        continue;
+
+      int j = std::distance(currKeyframe.points.ids.begin(), it);
+
+      prevKFPoints.push_back(prevKeyframe.points.pts[i]);
+      currKFPoints.push_back(currKeyframe.points.pts[j]);
+    }
+
+    // Defensive checks
+    if (prevKFPoints.size() < 8 || currKFPoints.size() < 8)
+    {
+      WARN("[VO Estimation] Not enough feature correspondences for essential matrix.");
+      return gtsam::Pose3(); // Identity by default
+    }
+
+    // Compute Essential Matrix
+    cv::Mat inlierMask;
+    cv::Mat E = cv::findEssentialMat(prevKFPoints, currKFPoints, K, cv::RANSAC, 0.999, 1.0, inlierMask);
+
+    if (E.empty())
+    {
+      WARN("[VO Estimation] Essential matrix computation failed.");
+      return gtsam::Pose3(); // Identity
+    }
+
+    // Recover relative pose from Essential matrix
+    cv::Mat R, t;
+    int inliers = cv::recoverPose(E, prevKFPoints, currKFPoints, K, R, t, inlierMask);
+
+    if (inliers < 8)
+    {
+      WARN("[VO Estimation] Too few inliers after pose recovery.");
+      return gtsam::Pose3(); // Identity
+    }
+
+    // Convert to gtsam::Pose3
+    // OpenCV Mat (3x3) → Eigen::Matrix3d
+    Eigen::Matrix3d R_eigen;
+    Eigen::Vector3d t_eigen;
+
+    cv::cv2eigen(R, R_eigen);
+    cv::cv2eigen(t, t_eigen);
+
+    gtsam::Rot3 rot = gtsam::Rot3(R_eigen);
+    gtsam::Point3 trans = gtsam::Point3(t_eigen);
+
+    gtsam::Pose3 relativePose(rot, trans);
+
+    OK("[VO Estimation] Relative pose computed with " << inliers << " inliers.");
+    return relativePose;
+  }
+
+  /**
+   *
+   */
   bool poseEstimation()
   {
+    if (!hasFirstKF)
+    {
+      WARN("[poseEstimation]: No keyframes available.");
+      return false;
+    }
+
+    if (prevKeyframe.points.pts.empty() || currKeyframe.points.pts.empty())
+    {
+      WARN("[poseEstimation]: Previous or current keyframe has no feature points.");
+      return false;
+    }
+
+    // === Time Interval ===
+    ros::Time t0 = prevKeyframe.timestamp;
+    ros::Time t1 = currKeyframe.timestamp;
+    double dt = (t1 - t0).toSec();
+
+    if (dt <= 0.0)
+    {
+      WARN("[poseEstimation]: Invalid timestamp interval.");
+      return false;
+    }
+
+    // === Inertial Priors ===
+    Eigen::Quaterniond quat = getInterpolatedQuat(t1);
+    Eigen::Vector3d avgVel = getAverageVelocity(t0, t1);
+    double avgAlt = getAverageAltitude(t0, t1);
+    Eigen::Vector3d delta_translation = avgVel * dt;
+
+    // === VO Estimation ===
+    gtsam::Pose3 relativePose = voEstimation();
+
+    // === GTSAM Symbols ===
+    gtsam::Symbol prevSym('x', prevKeyframe.index);
+    gtsam::Symbol currSym('x', currKeyframe.index);
+
+    // === Add VO Between Factor ===
+    auto voNoise = gtsam::noiseModel::Diagonal::Sigmas(
+        (gtsam::Vector(6) << VO_NOISE_ROT, VO_NOISE_ROT, VO_NOISE_ROT,
+         VO_NOISE_TRANS, VO_NOISE_TRANS, VO_NOISE_TRANS)
+            .finished());
+
+    gtsam::Pose3 prevPose = isam.calculateEstimate().at<gtsam::Pose3>(prevSym);
+    graph.add(gtsam::BetweenFactor<gtsam::Pose3>(prevSym, currSym, relativePose, voNoise));
+
+    // === Orientation Prior (from IMU) ===
+    gtsam::Rot3 rotPrior(quat);
+    auto rotNoise = gtsam::noiseModel::Isotropic::Sigma(3, ROT_PRIOR_NOISE);
+    graph.add(gtsam::PoseRotationPrior<gtsam::Pose3>(currSym, rotPrior, rotNoise));
+
+    // === Velocity-Based Translation Prior ===
+    gtsam::Point3 expectedTrans = prevPose.translation() + gtsam::Point3(delta_translation);
+    auto transNoise = gtsam::noiseModel::Isotropic::Sigma(3, TRANS_PRIOR_NOISE);
+    graph.add(gtsam::PoseTranslationPrior<gtsam::Pose3>(currSym, expectedTrans, transNoise));
+
+    // === Altitude Prior (Z only) ===
+    gtsam::Point3 zOnly(0.0, 0.0, avgAlt);
+    auto altNoise = gtsam::noiseModel::Diagonal::Sigmas(
+        (gtsam::Vector(3) << 1e6, 1e6, ALT_PRIOR_NOISE).finished());
+    graph.add(gtsam::PoseTranslationPrior<gtsam::Pose3>(currSym, zOnly, altNoise));
+
+    // === GPS Factor Every N Keyframes ===
+    if (currKeyframe.index % GPS_PRIOR_INTERVAL == 0)
+    {
+      // Find closest ENU reading
+      double minDiff = 1e6;
+      ENU closestGps;
+      bool found = false;
+
+      for (const auto &enu : gpsEnuBuffer)
+      {
+        double diff = std::abs((enu.timestamp - t1).toSec());
+        if (diff < minDiff)
+        {
+          minDiff = diff;
+          closestGps = enu;
+          found = true;
+        }
+      }
+
+      if (found)
+      {
+        gtsam::Point3 gps_meas(closestGps.x, closestGps.y, closestGps.z);
+        auto gpsNoise = gtsam::noiseModel::Isotropic::Sigma(3, GPS_NOISE);
+        graph.add(gtsam::GPSFactor(currSym, gps_meas, gpsNoise));
+        OK("[GPS Factor] Added at keyframe " << currKeyframe.index);
+      }
+      else
+      {
+        WARN("[GPS Factor] No GPS data available for keyframe " << currKeyframe.index);
+      }
+    }
+
+    // === Initial Estimate ===
+    gtsam::Pose3 currPoseGuess = prevPose.compose(relativePose);
+    if (!values.exists(currSym))
+    {
+      values.insert(currSym, currPoseGuess);
+    }
+
+    // === ISAM2 Update ===
+    isam.update(graph, values);
+    isam.update();
+    graph.resize(0);
+    values.clear();
+
+    // === Save Optimized Pose ===
+    gtsam::Pose3 optimizedPose = isam.calculateEstimate().at<gtsam::Pose3>(currSym);
+    currKeyframe.pose = optimizedPose;
+
+    // === Publish Pose ===
+    geometry_msgs::PoseStamped poseMsg;
+    poseMsg.header.stamp = currKeyframe.timestamp;
+    poseMsg.header.frame_id = "map";
+    poseMsg.pose.position.x = optimizedPose.translation().x();
+    poseMsg.pose.position.y = optimizedPose.translation().y();
+    poseMsg.pose.position.z = optimizedPose.translation().z();
+    poseMsg.pose.orientation.x = optimizedPose.rotation().toQuaternion().x();
+    poseMsg.pose.orientation.y = optimizedPose.rotation().toQuaternion().y();
+    poseMsg.pose.orientation.z = optimizedPose.rotation().toQuaternion().z();
+    poseMsg.pose.orientation.w = optimizedPose.rotation().toQuaternion().w();
+    posePub.publish(poseMsg);
+
+    // === Publish Path ===
+    pathMsg.header = poseMsg.header;
+    pathMsg.poses.push_back(poseMsg);
+    pathPub.publish(pathMsg);
+
+    OK("[Pose Estimation] Pose added for keyframe " << currKeyframe.index);
     return true;
   }
 };
