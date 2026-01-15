@@ -85,26 +85,12 @@ enum class vioState
 // =========================================================
 //  Data Structures
 // =========================================================
-/**
- * @brief Image Frame Structure
- * @param image Undistorted Image as cv::Mat
- * @param timestamp ROS Time Stamp
- * @return ImageFrame structure
- */
 struct ImageFrame
 {
   cv::Mat image;
   ros::Time timestamp;
 };
 
-/**
- * @brief Points Structure
- * @param ids Vector of Point IDs
- * @param pts Vector of 2D Points as cv::Point2f
- * @param isTracked Vector of booleans indicating if points are tracked
- * @param age Vector of integers indicating the age of each point
- * @return Points structure
- */
 struct Points
 {
   std::vector<int> ids;
@@ -113,14 +99,6 @@ struct Points
   std::vector<int> age;
 };
 
-/**
- * @brief Keyframe Structure
- * @param timestamp ROS Time Stamp
- * @param image Image associated with the keyframe as cv::Mat
- * @param points Points associated with the keyframe
- * @param pose Camera Pose as gtsam::Pose3
- * @return Keyframe structure
- */
 struct Keyframe
 {
   int index;
@@ -131,29 +109,16 @@ struct Keyframe
   gtsam::Pose3 pose;
 };
 
-/**
- * @brief ENU Referential Data Structure
- * @param timestam ROS Time Stamp
- * @param x coordinate in the ENU frame (double)
- * @param y coordinate in the ENU frame (double)
- * @param z coordinate in the ENU frame (double)
- * @return ENU structure
- */
 struct ENU
 {
   ros::Time timestamp;
   double x, y, z;
 };
 
-/**
- *  @brief Altitude (Barometer) data structure
- *  @param timestamp
- *  @param altitude
- */
 struct BaroAltitude
 {
   ros::Time timestamp;
-  double altitude;
+  double altitude; // NOTE: this is stored as RELATIVE altitude (ENU up) after fixes
 };
 
 // =========================================================
@@ -183,6 +148,7 @@ constexpr double e2 = 1 - (b * b) / (a * a);
 // =========================================================
 void geodeticToECEF(double lat, double lon, double alt, double &X, double &Y, double &Z)
 {
+  // lat/lon MUST be in radians
   double sinLat = sin(lat), cosLat = cos(lat);
   double sinLon = sin(lon), cosLon = cos(lon);
 
@@ -206,13 +172,29 @@ ENU ecefToENU(double X, double Y, double Z, double lat0, double lon0, double alt
   double sinLon = sin(lon0), cosLon = cos(lon0);
 
   ENU enu;
-  enu.x = -sinLon * dx + cosLon * dy;
-  enu.y = -cosLon * sinLat * dx - sinLon * sinLat * dy + cosLat * dz;
-  enu.z = cosLon * cosLat * dx + sinLon * cosLat * dy + sinLat * dz;
+  enu.x = -sinLon * dx + cosLon * dy;                                 // East
+  enu.y = -cosLon * sinLat * dx - sinLon * sinLat * dy + cosLat * dz; // North
+  enu.z = cosLon * cosLat * dx + sinLon * cosLat * dy + sinLat * dz;  // Up
 
   return enu;
 }
 
+/**
+ * Convert a quaternion expressed in NED world frame to ENU world frame.
+ *
+ * IMPORTANT NOTE:
+ * DJI/flight-stacks can represent attitude quaternions with different conventions:
+ * - body->world or world->body
+ * - NED or ENU
+ *
+ * Here we assume input quaternion represents: R_ned_body (body frame orientation wrt NED world),
+ * and we want: R_enu_body.
+ *
+ * For that case, the correct operation is:
+ *   R_enu_body = R_enu_ned * R_ned_body
+ * which corresponds to:
+ *   q_enu = q_tf * q_ned
+ */
 Eigen::Quaterniond convertNEDtoENU(const Eigen::Quaterniond &q_ned)
 {
   Eigen::Matrix3d R_ned_to_enu;
@@ -222,8 +204,8 @@ Eigen::Quaterniond convertNEDtoENU(const Eigen::Quaterniond &q_ned)
 
   Eigen::Quaterniond q_tf(R_ned_to_enu);
 
-  // Passive frame transformation: q_enu = R * q_ned * R⁻¹
-  return q_tf * q_ned * q_tf.inverse();
+  // Transform composition (NOT sandwich) for body->world convention:
+  return (q_tf * q_ned).normalized();
 }
 
 // =========================================================
@@ -237,58 +219,40 @@ public:
     // =========================================================
     // Setup
     // =========================================================
-    // Setting signal 'SIGINT' reception
     signal(SIGINT, signalHandler);
 
-    // Setting ROS Params
     loadParams();
 
-    // Start dynamic reconfigure server
     drCallback = boost::bind(&vioManager::configCallback, this, _1, _2);
     drServer.setCallback(drCallback);
 
-    // Load ROSBAG and messages
     bufferRosbagMessages(BAG_PATH);
 
-    // Initializing ROS Publishers
     matchingPub = nh.advertise<sensor_msgs::Image>("vio/feature_matches", 1);
     featurePub = nh.advertise<sensor_msgs::Image>("vio/feature_ages", 1);
     posePub = nh.advertise<geometry_msgs::PoseStamped>("vio/pose", 1);
     pathPub = nh.advertise<nav_msgs::Path>("vio/path", 1);
     gtPathPub = nh.advertise<nav_msgs::Path>("vio/ground_truth", 1, true);
 
-    // Initializing ROS Subscribers
     stateSub = nh.subscribe<std_msgs::UInt8>("vio/state", 1, &vioManager::stateCallback, this);
 
-    // Mapping images for faster undistorting
     cv::initUndistortRectifyMap(
-        K,                    // Intrinsic matrix
-        distCoeffs,           // Distortion coefficients
-        cv::Mat(),            // Optional rectification matrix (empty -> no stereo)
-        K,                    // New camera matrix (same as original)
-        cv::Size(1920, 1080), // Image size
-        CV_16SC2,             // Output map format
-        map1, map2            // Output maps
-    );
+        K,
+        distCoeffs,
+        cv::Mat(),
+        K,
+        cv::Size(1920, 1080),
+        CV_16SC2,
+        map1, map2);
 
-    // Initializing GTSAM
     // ====== ISAM2 Setup ======
-    gtsam::ISAM2Params params;
-    params.relinearizeThreshold = 0.1;
-    params.relinearizeSkip = 1;
-    isam = gtsam::ISAM2(params);
+    isamParams.relinearizeThreshold = 0.1;
+    isamParams.relinearizeSkip = 1;
+    rebuildISAM(); // adds x0 prior
 
-    // ====== Prior ======
-    gtsam::Pose3 prior;
-    auto priorNoise = gtsam::noiseModel::Diagonal::Sigmas(
-        (gtsam::Vector(6) << 0.1, 0.1, 0.1, 0.1, 0.1, 0.1).finished());
-
-    graph.add(gtsam::PriorFactor<gtsam::Pose3>(gtsam::Symbol('x', 0), prior, priorNoise));
-    values.insert(gtsam::Symbol('x', 0), prior);
-
-    isam.update(graph, values);
-    graph.resize(0);
-    values.clear();
+    // Initialize keyframes
+    prevKeyframe.index = -1;
+    currKeyframe.index = -1;
 
     // Publishing the Ground Truth
     nav_msgs::Path gtPath;
@@ -322,8 +286,9 @@ public:
         break;
 
       case vioState::RUNNING:
-        if (frameIdx == imgBuffer.size())
+        if (frameIdx >= static_cast<int>(imgBuffer.size()))
         {
+          stopLoopTimerAndReport();
           OK("[VIO Manager] Processing Ended! Changing state to RESET");
           vio_state_ = vioState::RESET;
         }
@@ -332,21 +297,25 @@ public:
           // Feature Detection + Feature Tracking
           bool frameSuccess = frameProcessing();
 
-          // Keyframe Processing Function
-          bool keyframeSuccess = keyframeProcessing();
+          // Keyframe decision + creation
+          bool newKeyframe = false;
+          if (frameSuccess) // only evaluate keyframes when we have a valid current frame
+          {
+            newKeyframe = keyframeProcessing();
+          }
 
-          // Estimation Function
-          bool estimateSuccess = poseEstimation();
+          // Estimation: ONLY on NEW keyframes
+          if (newKeyframe)
+          {
+            bool estimateSuccess = poseEstimation();
+            (void)estimateSuccess;
+          }
 
           if (frameSuccess)
           {
-            // [DEBUG] - Feature Ages Image Publisher
             debugImageFeatureAges();
-
-            // [DEBUG] - Feature Matching Image Publisher
             debugImageFeatureMatching();
 
-            // Update previous frame data
             prevFrame = currFrame;
             prevPoints = currPoints;
           }
@@ -355,8 +324,9 @@ public:
 
       case vioState::RESET:
         WARN("[VIO Manager] Reset Command Received! Setting variables to default...");
+        stopLoopTimerAndReport();
         statesReset();
-        OK("[VIO Manager] Variables resetted!");
+        OK("[VIO Manager] Variables reset!");
         vio_state_ = vioState::IDLE;
         break;
 
@@ -376,7 +346,6 @@ private:
   // =========================================================
   // Variables
   // =========================================================
-  // ROS Related
   ros::NodeHandle nh;
   ros::Publisher matchingPub, featurePub, posePub, pathPub, gtPathPub;
   ros::Subscriber stateSub, resetSub;
@@ -386,7 +355,6 @@ private:
   dynamic_reconfigure::Server<fuims::vioParamsConfig> drServer;
   dynamic_reconfigure::Server<fuims::vioParamsConfig>::CallbackType drCallback;
 
-  // Global Variables for ROS Parameters
   // === General VIO Parameters ===
   int MAX_FEATURES, MIN_FEATURES, MIN_TRACKED_FEATURES, MAX_TRACKING_AGE,
       KF_FEATURE_THRESHOLD, KF_PARALLAX_THRESHOLD, GPS_PRIOR_INTERVAL;
@@ -404,12 +372,12 @@ private:
   // === ROS Topic Message Rates ===
   int CAMERA_RATE, INERTIAL_RATE;
 
-  // VO and Inertial Prior Noise (dynamic reconfigurable)
+  // VO and Inertial Prior Noise
   double VO_NOISE_ROT, VO_NOISE_TRANS, ROT_PRIOR_NOISE, TRANS_PRIOR_NOISE, ALT_PRIOR_NOISE, GPS_NOISE;
 
   // ROS Topic Messages Buffers
   std::deque<sensor_msgs::CompressedImageConstPtr> imgBuffer;
-  std::deque<sensor_msgs::NavSatFixConstPtr> gpsBuffer;
+  std::deque<sensor_msgs::NavSatFixConstPtr> gpsBuffer; // (still unused but kept)
   std::deque<ENU> gpsEnuBuffer;
   std::deque<BaroAltitude> altBuffer;
   std::deque<geometry_msgs::Vector3StampedConstPtr> velBuffer;
@@ -430,6 +398,7 @@ private:
 
   // Status variables
   vioState vio_state_ = vioState::IDLE;
+  vioState last_vio_state_ = vioState::IDLE;
   bool isFirstFrame = true;
   bool hasFirstKF = false;
   int frameIdx = 0;
@@ -440,10 +409,15 @@ private:
   Points currPoints, prevPoints, trackedPoints;
   int nextFeatureID = 0;
 
+  // ===== Execution Time Metric =====
+  bool loopTimingActive_ = false;
+  ros::WallTime loopStartWall_;
+
   // Keyframes
   Keyframe prevKeyframe, currKeyframe;
 
   // GTSAM related
+  gtsam::ISAM2Params isamParams;
   gtsam::ISAM2 isam;
   gtsam::NonlinearFactorGraph graph;
   gtsam::Values values;
@@ -451,14 +425,27 @@ private:
   // =========================================================
   // Helpers
   // =========================================================
-  /**
-   * @brief ROS Parameter Loader
-   * @param void
-   * @return void
-   */
+  void rebuildISAM()
+  {
+    isam = gtsam::ISAM2(isamParams);
+    graph.resize(0);
+    values.clear();
+
+    // Prior at x0
+    gtsam::Pose3 prior;
+    auto priorNoise = gtsam::noiseModel::Diagonal::Sigmas(
+        (gtsam::Vector(6) << 0.1, 0.1, 0.1, 0.1, 0.1, 0.1).finished());
+
+    graph.add(gtsam::PriorFactor<gtsam::Pose3>(gtsam::Symbol('x', 0), prior, priorNoise));
+    values.insert(gtsam::Symbol('x', 0), prior);
+
+    isam.update(graph, values);
+    graph.resize(0);
+    values.clear();
+  }
+
   void loadParams()
   {
-    // === General VIO Parameters ===
     nh.param("MIN_FEATURES", MIN_FEATURES, 25);
     nh.param("MAX_FEATURES", MAX_FEATURES, 250);
     nh.param("MIN_TRACKED_FEATURES", MIN_TRACKED_FEATURES, 35);
@@ -468,13 +455,11 @@ private:
     nh.param("KF_PARALLAX_THRESHOLD", KF_PARALLAX_THRESHOLD, 28);
     nh.param("GPS_PRIOR_INTERVAL", GPS_PRIOR_INTERVAL, 10);
 
-    // === GFTT Parameters ===
     nh.param("GFTT_MAX_FEATURES", GFTT_MAX_FEATURES, 500);
     nh.param("GFTT_BLOCK_SIZE", GFTT_BLOCK_SIZE, 3);
     nh.param("GFTT_QUALITY", GFTT_QUALITY, 0.15);
     nh.param("GFTT_MIN_DIST", GFTT_MIN_DIST, 26.0);
 
-    // === KLT Parameters ===
     nh.param("KLT_MAX_LEVEL", KLT_MAX_LEVEL, 4);
     nh.param("KLT_ITERS", KLT_ITERS, 30);
     nh.param("KLT_BORDER_MARGIN", KLT_BORDER_MARGIN, 10);
@@ -482,11 +467,9 @@ private:
     nh.param("KLT_MIN_EIG", KLT_MIN_EIG, 1e-4);
     nh.param("KLT_FB_THRESH_PX", KLT_FB_THRESH_PX, 1.0f);
 
-    // === ROS Topic Message Rates ===
     nh.param("CAMERA_RATE", CAMERA_RATE, 15);
     nh.param("INERTIAL_RATE", INERTIAL_RATE, 30);
 
-    // === GTSAM Noise Values ===
     nh.param("VO_NOISE_ROT", VO_NOISE_ROT, 0.2);
     nh.param("VO_NOISE_TRANS", VO_NOISE_TRANS, 0.5);
     nh.param("ROT_PRIOR_NOISE", ROT_PRIOR_NOISE, 0.05);
@@ -495,20 +478,6 @@ private:
     nh.param("GPS_NOISE", GPS_NOISE, 1.0);
   }
 
-  /**
-   * @brief ROSBAG Buffer Messages
-   * @param bag_path  Path to the desired ROSBAG to be processed
-   * @return void
-   *
-   * This helper function reads the ROSBAG content and processes the information.
-   * The camera messages are all placed on a buffer for posterior processing
-   * The inertial messages (quaternion, velocity and gps) are processed in order to convert their referential
-   * to the ENU frame.
-   *
-   * GPS: WGS-84 -> ENU
-   * Velocity: NEU -> ENU
-   * Quaternion: NED -> ENU
-   */
   void bufferRosbagMessages(const std::string &bag_path)
   {
     rosbag::Bag bag;
@@ -532,17 +501,27 @@ private:
           imgBuffer.push_back(img);
       }
 
-      /* ================= GPS (WGS-84) ================= */
+      /* ================= GPS ================= */
       else if (m.getTopic() == GPS_TOPIC)
       {
         auto gps = m.instantiate<sensor_msgs::NavSatFix>();
         if (!gps)
           continue;
 
-        // Convert degrees to radians
-        double lat_rad = gps->latitude * M_PI / 180.0;
-        double lon_rad = gps->longitude * M_PI / 180.0;
-        double alt = gps->altitude;
+        // USER NOTE APPLIED:
+        // You stated that LAT/LON arrive in RADIANS already.
+        // Therefore, DO NOT convert degrees -> radians here.
+        // If this is wrong for your bag, ENU will be totally wrong.
+        const double lat_rad = gps->latitude;
+        const double lon_rad = gps->longitude;
+        const double alt = gps->altitude;
+
+        // Optional sanity check: if lat/lon look like degrees, warn
+        if (std::abs(lat_rad) > M_PI + 0.2 || std::abs(lon_rad) > 2.0 * M_PI + 0.2)
+        {
+          WARN("[GPS] lat/lon magnitude looks like degrees, but code assumes radians!");
+          WARN("  lat=" << lat_rad << " lon=" << lon_rad << " (expected radians)");
+        }
 
         // Initialize ENU origin at first GPS fix
         if (!enuOriginInitialized)
@@ -551,6 +530,11 @@ private:
           lon0_rad = lon_rad;
           alt0 = alt;
           enuOriginInitialized = true;
+
+          INFO("[ENU Origin] Set from first GPS fix (ASSUMED RADIANS):");
+          INFO("  lat(rad) = " << lat0_rad << "  lat(deg) = " << lat0_rad * 180.0 / M_PI);
+          INFO("  lon(rad) = " << lon0_rad << "  lon(deg) = " << lon0_rad * 180.0 / M_PI);
+          INFO("  alt(m)   = " << alt0);
         }
 
         // WGS-84 → ECEF
@@ -560,37 +544,53 @@ private:
         // ECEF → ENU
         ENU enu = ecefToENU(X, Y, Z, lat0_rad, lon0_rad, alt0);
         enu.timestamp = gps->header.stamp;
-
         gpsEnuBuffer.push_back(enu);
 
-        // Store altitude independently (baro / fused altitude)
+        // Store altitude RELATIVE (consistent with ENU/map frame)
         BaroAltitude baro;
         baro.timestamp = gps->header.stamp;
-        baro.altitude = alt;
+        baro.altitude = enu.z; // RELATIVE vertical displacement
         altBuffer.push_back(baro);
+
+        // DEBUG: First point should be ~0,0,0
+        if (gpsEnuBuffer.size() == 1)
+        {
+          INFO("[ENU Conversion] First GPS ENU should be near (0,0,0)");
+          INFO("  ENU: x=" << enu.x << " y=" << enu.y << " z=" << enu.z);
+        }
+
+        // DEBUG: show first few
+        if (gpsEnuBuffer.size() <= 5)
+        {
+          INFO("[ENU Conversion] GPS ENU #" << gpsEnuBuffer.size());
+          INFO("  Raw GPS: lat(rad)=" << gps->latitude
+                                      << ", lon(rad)=" << gps->longitude
+                                      << ", alt=" << alt);
+          INFO("  ENU: x=" << enu.x << ", y=" << enu.y << ", z=" << enu.z);
+          INFO("  Altitude stored (REL, enu.z): " << baro.altitude);
+        }
       }
 
-      /* ================= VELOCITY: NEU → ENU ================= */
+      /* ================= VELOCITY ================= */
       else if (m.getTopic() == VELOCITY_TOPIC)
       {
         auto vel = m.instantiate<geometry_msgs::Vector3Stamped>();
         if (!vel)
           continue;
 
-        geometry_msgs::Vector3StampedPtr enuVel(
-            new geometry_msgs::Vector3Stamped(*vel));
+        geometry_msgs::Vector3StampedPtr enuVel(new geometry_msgs::Vector3Stamped(*vel));
 
-        // DJI publishes NEU: (North, East, Up)
-        // Convert to ENU: (East, North, Up)
+        // Assumption: DJI publishes NEU (North, East, Up)
+        // Convert to ENU (East, North, Up)
         enuVel->header = vel->header;
         enuVel->vector.x = vel->vector.y; // East
         enuVel->vector.y = vel->vector.x; // North
-        enuVel->vector.z = vel->vector.z; // Up (NO sign flip)
+        enuVel->vector.z = vel->vector.z; // Up (if your source is NED, you MUST flip sign!)
 
         velBuffer.push_back(enuVel);
       }
 
-      /* ================= QUATERNION: NED → ENU ================= */
+      /* ================= QUATERNION ================= */
       else if (m.getTopic() == QUATERNION_TOPIC)
       {
         auto quat = m.instantiate<geometry_msgs::QuaternionStamped>();
@@ -605,9 +605,7 @@ private:
 
         Eigen::Quaterniond q_enu = convertNEDtoENU(q_ned);
 
-        geometry_msgs::QuaternionStampedPtr enuQuat(
-            new geometry_msgs::QuaternionStamped(*quat));
-
+        geometry_msgs::QuaternionStampedPtr enuQuat(new geometry_msgs::QuaternionStamped(*quat));
         enuQuat->header = quat->header;
         enuQuat->quaternion.w = q_enu.w();
         enuQuat->quaternion.x = q_enu.x();
@@ -618,6 +616,27 @@ private:
       }
     }
 
+    if (!altBuffer.empty())
+    {
+      double min_alt = altBuffer.front().altitude;
+      double max_alt = altBuffer.front().altitude;
+
+      for (const auto &baro : altBuffer)
+      {
+        min_alt = std::min(min_alt, baro.altitude);
+        max_alt = std::max(max_alt, baro.altitude);
+      }
+
+      INFO("[DEBUG] Relative altitude range (stored as ENU.z):");
+      INFO("  Min: " << min_alt << " m");
+      INFO("  Max: " << max_alt << " m");
+      INFO("  Δ:   " << (max_alt - min_alt) << " m");
+    }
+    else
+    {
+      WARN("[DEBUG] Altitude buffer is empty. No altitude range to show.");
+    }
+
     bag.close();
 
     INFO("ROSBAG Messages Processed (ENU)");
@@ -625,22 +644,51 @@ private:
     OK("Quaternion ENU messages total: " << quatBuffer.size());
     OK("Velocity ENU messages total: " << velBuffer.size());
     OK("GPS ENU messages total: " << gpsEnuBuffer.size());
-    OK("Altitude (Baro) messages total: " << altBuffer.size());
+    OK("Altitude (REL) messages total: " << altBuffer.size());
   }
 
   void statesReset()
   {
+    // Core runtime state
     isFirstFrame = true;
     hasFirstKF = false;
     frameIdx = 0;
     keyframeIdx = 0;
+    nextFeatureID = 0;
+
+    // Frames / points
+    currFrame = ImageFrame();
+    prevFrame = ImageFrame();
+    currPoints = Points();
+    prevPoints = Points();
+    trackedPoints = Points();
+
+    // Keyframes
     currKeyframe = Keyframe();
     prevKeyframe = Keyframe();
+    prevKeyframe.index = -1;
+    currKeyframe.index = -1;
+
+    // Path
+    pathMsg.poses.clear();
+    pathMsg.header.frame_id = "map";
+
+    // Reset optimizer (VERY IMPORTANT)
+    rebuildISAM();
   }
 
-  /**
-   *
-   */
+  void clearEstimatedPath()
+  {
+    pathMsg.poses.clear();
+    pathMsg.header.frame_id = "map";
+    pathMsg.header.stamp = ros::Time::now();
+
+    // Publish empty path so RViz clears immediately
+    pathPub.publish(pathMsg);
+
+    INFO("[RVIZ] Estimated path cleared.");
+  }
+
   bool inImage(const cv::Point2f &p, const cv::Mat &img)
   {
     return p.x >= 16 && p.y >= 16 && p.x < img.cols - 16 && p.y < img.rows - 16;
@@ -660,7 +708,7 @@ private:
     for (size_t i = 0; i < std::min(pts1.size(), pts2.size()); ++i)
     {
       cv::Point2f pt1 = pts1[i];
-      cv::Point2f pt2 = pts2[i] + cv::Point2f(static_cast<float>(img1.cols), 0); // offset for right image
+      cv::Point2f pt2 = pts2[i] + cv::Point2f(static_cast<float>(img1.cols), 0);
       cv::line(vis, pt1, pt2, cv::Scalar(0, 255, 0), 1);
       cv::circle(vis, pt1, 3, cv::Scalar(255, 0, 0), -1);
       cv::circle(vis, pt2, 3, cv::Scalar(0, 0, 255), -1);
@@ -680,9 +728,9 @@ private:
       cv::Scalar color;
 
       if (age >= MAX_TRACKING_AGE)
-        color = cv::Scalar(0, 255, 0); // Green for old
+        color = cv::Scalar(0, 255, 0);
       else
-        color = cv::Scalar(0, 0, 255); // Red for young
+        color = cv::Scalar(0, 0, 255);
 
       cv::circle(vis, points.pts[i], 3, color, -1);
     }
@@ -692,6 +740,8 @@ private:
 
   void debugImageFeatureAges()
   {
+    if (currFrame.image.empty())
+      return;
     cv::Mat ageVis = drawFeatureAges(currFrame.image, currPoints);
     sensor_msgs::ImagePtr ageMsg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", ageVis).toImageMsg();
     ageMsg->header.stamp = currFrame.timestamp;
@@ -700,11 +750,15 @@ private:
 
   void debugImageFeatureMatching()
   {
+    if (prevFrame.image.empty() || currFrame.image.empty())
+      return;
+
     std::unordered_map<int, cv::Point2f> currPointMap;
     for (size_t i = 0; i < currPoints.ids.size(); ++i)
     {
       currPointMap[currPoints.ids[i]] = currPoints.pts[i];
     }
+
     std::vector<cv::Point2f> matchedPrevPts, matchedCurrPts;
     for (size_t i = 0; i < prevPoints.ids.size(); ++i)
     {
@@ -716,6 +770,7 @@ private:
         matchedCurrPts.push_back(it->second);
       }
     }
+
     cv::Mat matchVis = drawFeatureMatches(prevFrame.image, currFrame.image,
                                           matchedPrevPts, matchedCurrPts);
     sensor_msgs::ImagePtr matchMsg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", matchVis).toImageMsg();
@@ -723,15 +778,28 @@ private:
     matchingPub.publish(matchMsg);
   }
 
+  void startLoopTimer()
+  {
+    loopStartWall_ = ros::WallTime::now();
+    loopTimingActive_ = true;
+    INFO("[Execution Timer] Loop timer started.");
+  }
+
+  void stopLoopTimerAndReport()
+  {
+    if (!loopTimingActive_)
+      return;
+
+    ros::WallDuration dt = ros::WallTime::now() - loopStartWall_;
+    loopTimingActive_ = false;
+
+    OK("[Execution Timer] Full RUNNING loop execution time: " << std::fixed << std::setprecision(3)
+                                                              << dt.toSec() << " seconds");
+  }
+
   // =========================================================
   // Callbacks
   // =========================================================
-  /**
-   * @brief Dynamic Reconfigure Callback
-   * @param config vioParams Configuration
-   * @param level Bit mask indicating modified params
-   * @return void
-   */
   void configCallback(fuims::vioParamsConfig &config, uint32_t level)
   {
     MAX_FEATURES = config.MAX_FEATURES;
@@ -741,36 +809,37 @@ private:
     KF_FEATURE_THRESHOLD = config.KF_FEATURE_THRESHOLD;
     KF_PARALLAX_THRESHOLD = config.KF_PARALLAX_THRESHOLD;
     GPS_PRIOR_INTERVAL = config.GPS_PRIOR_INTERVAL;
+
     GFTT_MAX_FEATURES = config.GFTT_MAX_FEATURES;
     GFTT_BLOCK_SIZE = config.GFTT_BLOCK_SIZE;
     GFTT_QUALITY = config.GFTT_QUALITY;
     GFTT_MIN_DIST = config.GFTT_MIN_DIST;
+
     KLT_MAX_LEVEL = config.KLT_MAX_LEVEL;
     KLT_ITERS = config.KLT_ITERS;
     KLT_BORDER_MARGIN = config.KLT_BORDER_MARGIN;
     KLT_EPS = config.KLT_EPS;
     KLT_MIN_EIG = config.KLT_MIN_EIG;
     KLT_FB_THRESH_PX = config.KLT_FB_THRESH_PX;
+
     CAMERA_RATE = config.CAMERA_RATE;
     INERTIAL_RATE = config.INERTIAL_RATE;
+
     VO_NOISE_ROT = config.VO_NOISE_ROT;
     VO_NOISE_TRANS = config.VO_NOISE_TRANS;
     ROT_PRIOR_NOISE = config.ROT_PRIOR_NOISE;
     TRANS_PRIOR_NOISE = config.TRANS_PRIOR_NOISE;
     ALT_PRIOR_NOISE = config.ALT_PRIOR_NOISE;
 
+    // NOTE: GPS_NOISE is not present in your config callback originally.
+    // If it's in your .cfg, add it here too.
+    // GPS_NOISE = config.GPS_NOISE;
+
     INFO("Dynamic reconfigure updated VIO parameters.");
     WARN("Changing VIO State to RESET");
     vio_state_ = vioState::RESET;
   }
 
-  /**
-   * @brief Reset Callback
-   * @param msg UInt8 Message
-   * @return void
-   *
-   * This callback changes the execution state of this node
-   */
   void stateCallback(const std_msgs::UInt8ConstPtr &msg)
   {
     vioState new_state = static_cast<vioState>(msg->data);
@@ -783,6 +852,13 @@ private:
       break;
 
     case vioState::RUNNING:
+      // If we are starting fresh from IDLE, clear RViz estimated path
+      if (last_vio_state_ == vioState::IDLE)
+      {
+        clearEstimatedPath();
+        startLoopTimer();
+      }
+
       vio_state_ = vioState::RUNNING;
       INFO("VIO State changed to RUNNING");
       break;
@@ -796,19 +872,13 @@ private:
       WARN("Unknown VIO state received: " << static_cast<int>(msg->data));
       break;
     }
+
+    last_vio_state_ = vio_state_;
   }
 
   // =========================================================
   // Methods
   // =========================================================
-  /**
-   * @brief Undistort Image
-   * @param msg Compressed Image Message
-   * @return undistorted greyscale image as cv::Mat
-   *
-   * This method undistorts the incoming compressed image using the predefined camera matrix and distortion coefficients.
-   * It returns the undistorted image as a cv::Mat object, with a greyscale colorformat.
-   */
   ImageFrame undistortImage(const sensor_msgs::CompressedImageConstPtr msg)
   {
     ImageFrame frame;
@@ -818,28 +888,20 @@ private:
     if (raw.empty())
       return frame;
 
-    // If needed, resize maps to match current image size
     if (map1.empty() || map1.size() != raw.size())
     {
       cv::initUndistortRectifyMap(K, distCoeffs, cv::Mat(), K,
                                   raw.size(), CV_16SC2, map1, map2);
     }
 
-    // Use remap for efficient undistortion
     cv::remap(raw, frame.image, map1, map2, cv::INTER_LINEAR);
     return frame;
   }
 
-  /**
-   * @brief Feature Detection
-   * @param img Input Image as cv::Mat
-   * @return Detected Points structure
-   */
   Points featureDetection(const cv::Mat &img)
   {
     Points detectedPoints;
 
-    // GFTT Detector
     std::vector<cv::Point2f> features;
     cv::goodFeaturesToTrack(
         img,
@@ -852,7 +914,6 @@ private:
         false,
         0.04);
 
-    // Fill the points structure
     for (const auto &pt : features)
     {
       detectedPoints.pts.push_back(pt);
@@ -864,45 +925,35 @@ private:
     return detectedPoints;
   }
 
-  /**
-   *
-   */
   Points featureTracking()
   {
-    // Temporary variables
     Points filteredPoints;
-    std::vector<cv::Point2f> trackedPoints;
+    std::vector<cv::Point2f> tracked;
     std::vector<uchar> status;
     std::vector<float> error;
 
-    // Optical Flow
     cv::calcOpticalFlowPyrLK(
         prevFrame.image,
         currFrame.image,
         prevPoints.pts,
-        trackedPoints,
+        tracked,
         status,
         error,
         cv::Size(21, 21),
         KLT_MAX_LEVEL);
 
-    // Results Processing
     for (size_t i = 0; i < status.size(); i++)
     {
-      // Checking if tracking was successful
       if (!status[i])
         continue;
 
-      // Check tracking error
       if (error[i] > MAX_TRACKING_ERROR_PX)
         continue;
 
-      // Check if points are inside image borders
-      if (!inImage(trackedPoints[i], currFrame.image) || !inImage(prevPoints.pts[i], prevFrame.image))
+      if (!inImage(tracked[i], currFrame.image) || !inImage(prevPoints.pts[i], prevFrame.image))
         continue;
 
-      // Store tracked point
-      filteredPoints.pts.push_back(trackedPoints[i]);
+      filteredPoints.pts.push_back(tracked[i]);
       filteredPoints.ids.push_back(prevPoints.ids[i]);
       filteredPoints.isTracked.push_back(true);
       filteredPoints.age.push_back(prevPoints.age[i] + 1);
@@ -911,9 +962,6 @@ private:
     return filteredPoints;
   }
 
-  /**
-   *
-   */
   void replenishFeatures(const cv::Mat &img)
   {
     int featuresToAdd = MAX_FEATURES - static_cast<int>(currPoints.pts.size());
@@ -948,8 +996,8 @@ private:
 
       currPoints.pts.push_back(pt);
       currPoints.ids.push_back(nextFeatureID++);
-      currPoints.isTracked.push_back(false); // Not yet tracked
-      currPoints.age.push_back(0);           // New feature
+      currPoints.isTracked.push_back(false);
+      currPoints.age.push_back(0);
 
       featuresToAdd--;
       if (featuresToAdd <= 0)
@@ -957,36 +1005,40 @@ private:
     }
   }
 
-  /**
-   *
-   */
   bool frameProcessing()
   {
-    // First Frame Processing
     if (isFirstFrame)
     {
       prevFrame = undistortImage(imgBuffer[frameIdx++]);
+      if (prevFrame.image.empty())
+      {
+        WARN("[Frame " << frameIdx << "] First frame image empty!");
+        return false;
+      }
       prevPoints = featureDetection(prevFrame.image);
       isFirstFrame = false;
       OK("[Frame " << frameIdx << "] First Frame Processed");
-      return false;
+      return false; // no current frame yet
     }
 
-    // Not enough 'prevPoints' or Image Acquisition Error
-    if (prevPoints.pts.size() < MIN_FEATURES || prevFrame.image.empty())
+    if (prevPoints.pts.size() < static_cast<size_t>(MIN_FEATURES) || prevFrame.image.empty())
     {
       WARN("[Frame " << frameIdx + 1 << "] No previous points to track. Detecting new features.");
       prevFrame = undistortImage(imgBuffer[frameIdx++]);
+      if (prevFrame.image.empty())
+        return false;
       prevPoints = featureDetection(prevFrame.image);
       return false;
     }
 
     currFrame = undistortImage(imgBuffer[frameIdx++]);
+    if (currFrame.image.empty())
+    {
+      WARN("[Frame " << frameIdx << "] Current frame image empty!");
+      return false;
+    }
 
-    // Feature Tracking [Using LK Optical Flow]
     currPoints = featureTracking();
-
-    // Feature Replenishing to maxFeatures
     replenishFeatures(currFrame.image);
 
     return true;
@@ -994,7 +1046,6 @@ private:
 
   double computeParallax(Points kfPoints, Points framePoints)
   {
-    // Defensive Checks
     if (kfPoints.ids.size() != kfPoints.pts.size())
     {
       WARN("KF points ids/pts size mismatch");
@@ -1006,20 +1057,16 @@ private:
       return 0.0;
     }
 
-    // Auxillary variables
     int cnt = 0;
     double sum = 0.0;
 
-    // Build fast LUT
-    std::unordered_map<int, int>
-        id_to_idx;
+    std::unordered_map<int, int> id_to_idx;
     id_to_idx.reserve(framePoints.ids.size());
     for (size_t i = 0; i < framePoints.ids.size(); ++i)
     {
       id_to_idx[framePoints.ids[i]] = static_cast<int>(i);
     }
 
-    // Cycling through the KF Points
     for (size_t i = 0; i < kfPoints.ids.size(); i++)
     {
       int kfID = kfPoints.ids[i];
@@ -1029,11 +1076,9 @@ private:
 
       int j = it->second;
 
-      // Diference between x and y pixels
       double dx = framePoints.pts[j].x - kfPoints.pts[i].x;
       double dy = framePoints.pts[j].y - kfPoints.pts[i].y;
 
-      // Euclidean Distance
       sum += std::sqrt(dx * dx + dy * dy);
       cnt++;
     }
@@ -1042,15 +1087,16 @@ private:
   }
 
   /**
-   *
+   * Keyframe processing: now returns TRUE ONLY when a new keyframe is created.
    */
   bool keyframeProcessing()
   {
-    // Clear last trackedPoints
     trackedPoints.pts.clear();
     trackedPoints.ids.clear();
+    trackedPoints.isTracked.clear();
+    trackedPoints.age.clear();
 
-    // Filtering features by their age
+    // Filter features by age
     for (size_t i = 0; i < currPoints.pts.size(); i++)
     {
       if (currPoints.age[i] >= MAX_TRACKING_AGE)
@@ -1060,62 +1106,76 @@ private:
       }
     }
 
-    // Keyframe Decision
     bool isKeyframe = false;
-    if (!hasFirstKF && trackedPoints.pts.size() >= MIN_TRACKED_FEATURES) // First Keyframe
+
+    if (!hasFirstKF && trackedPoints.pts.size() >= static_cast<size_t>(MIN_TRACKED_FEATURES))
     {
       isKeyframe = true;
     }
-    else if (hasFirstKF && trackedPoints.pts.size() >= MIN_TRACKED_FEATURES) // Subsequent Keyframes
+    else if (hasFirstKF && trackedPoints.pts.size() >= static_cast<size_t>(MIN_TRACKED_FEATURES))
     {
-      // Calculate parallax between current frame Points and last keyframe Points
       double kfParallax = computeParallax(currKeyframe.points, trackedPoints);
 
-      // Verifying Keyframe creation conditions (Parallax and Feature)
       if (kfParallax > KF_PARALLAX_THRESHOLD)
         isKeyframe = true;
-      if (trackedPoints.pts.size() < KF_FEATURE_THRESHOLD)
+      if (trackedPoints.pts.size() < static_cast<size_t>(KF_FEATURE_THRESHOLD))
         isKeyframe = true;
     }
 
-    // Keyframe creation
-    if (isKeyframe)
+    if (!isKeyframe)
+      return false;
+
+    OK("[Frame " << frameIdx << "] New Keyframe created with "
+                 << trackedPoints.pts.size() << " features.");
+
+    const ros::Time kfTime = currFrame.timestamp;
+
+    if (!hasFirstKF)
     {
-      OK("[Frame " << frameIdx << "] New Keyframe created with "
-                   << trackedPoints.pts.size() << " features. ");
-      const ros::Time kfTime = currFrame.timestamp;
+      // FIRST keyframe MUST correspond to x0 which already exists in iSAM (prior)
+      currKeyframe.index = 0;
+      keyframeIdx = 1; // next created keyframe will be 1
+      currKeyframe.frameID = frameIdx;
+      currKeyframe.image = currFrame.image.clone();
+      currKeyframe.points = trackedPoints;
+      currKeyframe.timestamp = kfTime;
 
-      if (!hasFirstKF) // First Keyframe Initialization
-      {
-        // Fill Keyframe structure
-        currKeyframe.index = keyframeIdx++;
-        currKeyframe.frameID = frameIdx;
-        currKeyframe.image = currFrame.image.clone();
-        currKeyframe.points = trackedPoints;
-        currKeyframe.timestamp = kfTime;
+      // use prior pose as initial KF pose
+      currKeyframe.pose = gtsam::Pose3();
 
-        hasFirstKF = true;
-      }
-      else // Subsequent Keyframes
-      {
-        // Update Previous Keyframe Data
-        prevKeyframe = currKeyframe;
+      hasFirstKF = true;
 
-        // Fill Keyframe structure
-        currKeyframe.index = keyframeIdx++;
-        currKeyframe.frameID = frameIdx;
-        currKeyframe.image = currFrame.image.clone();
-        currKeyframe.points = trackedPoints;
-        currKeyframe.timestamp = kfTime;
-      }
+      // publish initial pose
+      geometry_msgs::PoseStamped poseMsg;
+      poseMsg.header.stamp = currKeyframe.timestamp;
+      poseMsg.header.frame_id = "map";
+      poseMsg.pose.position.x = 0.0;
+      poseMsg.pose.position.y = 0.0;
+      poseMsg.pose.position.z = 0.0;
+      poseMsg.pose.orientation.w = 1.0;
+      posePub.publish(poseMsg);
+
+      pathMsg.header = poseMsg.header;
+      pathMsg.poses.push_back(poseMsg);
+      pathPub.publish(pathMsg);
+
+      // prevKeyframe is not valid yet (needs a second KF)
+      prevKeyframe.index = -1;
+      return true;
     }
+
+    // Subsequent keyframes
+    prevKeyframe = currKeyframe;
+
+    currKeyframe.index = keyframeIdx++;
+    currKeyframe.frameID = frameIdx;
+    currKeyframe.image = currFrame.image.clone();
+    currKeyframe.points = trackedPoints;
+    currKeyframe.timestamp = kfTime;
 
     return true;
   }
 
-  /**
-   *
-   */
   Eigen::Quaterniond getInterpolatedQuat(ros::Time time)
   {
     if (quatBuffer.size() < 2)
@@ -1124,7 +1184,6 @@ private:
       return Eigen::Quaterniond::Identity();
     }
 
-    // Try to interpolate between two surrounding quaternions
     for (size_t i = 1; i < quatBuffer.size(); ++i)
     {
       auto prev = quatBuffer[i - 1];
@@ -1132,22 +1191,20 @@ private:
 
       if (prev->header.stamp <= time && next->header.stamp >= time)
       {
-        double t = (time - prev->header.stamp).toSec() /
-                   (next->header.stamp - prev->header.stamp).toSec();
+        double denom = (next->header.stamp - prev->header.stamp).toSec();
+        if (denom <= 1e-9)
+          return Eigen::Quaterniond::Identity();
 
-        Eigen::Quaterniond q1(
-            prev->quaternion.w, prev->quaternion.x,
-            prev->quaternion.y, prev->quaternion.z);
+        double t = (time - prev->header.stamp).toSec() / denom;
 
-        Eigen::Quaterniond q2(
-            next->quaternion.w, next->quaternion.x,
-            next->quaternion.y, next->quaternion.z);
+        Eigen::Quaterniond q1(prev->quaternion.w, prev->quaternion.x, prev->quaternion.y, prev->quaternion.z);
+        Eigen::Quaterniond q2(next->quaternion.w, next->quaternion.x, next->quaternion.y, next->quaternion.z);
 
-        return q1.slerp(t, q2); // SLERP
+        return q1.slerp(t, q2).normalized();
       }
     }
 
-    // Fallback: use the closest available quaternion
+    // fallback: closest
     auto closest = quatBuffer[0];
     double minTimeDiff = std::abs((closest->header.stamp - time).toSec());
 
@@ -1158,24 +1215,16 @@ private:
       {
         minTimeDiff = timeDiff;
         closest = quatBuffer[i];
-
-        // Early return on perfect match
         if (timeDiff == 0.0)
-        {
-          return Eigen::Quaterniond(closest->quaternion.w, closest->quaternion.x,
-                                    closest->quaternion.y, closest->quaternion.z);
-        }
+          break;
       }
     }
 
-    // Return the closest quaternion
     return Eigen::Quaterniond(closest->quaternion.w, closest->quaternion.x,
-                              closest->quaternion.y, closest->quaternion.z);
+                              closest->quaternion.y, closest->quaternion.z)
+        .normalized();
   }
 
-  /**
-   *
-   */
   Eigen::Vector3d getAverageVelocity(ros::Time t0, ros::Time t1)
   {
     Eigen::Vector3d sum(0, 0, 0);
@@ -1185,10 +1234,7 @@ private:
     {
       if (vel->header.stamp >= t0 && vel->header.stamp <= t1)
       {
-        sum += Eigen::Vector3d(
-            vel->vector.x,
-            vel->vector.y,
-            vel->vector.z);
+        sum += Eigen::Vector3d(vel->vector.x, vel->vector.y, vel->vector.z);
         ++count;
       }
     }
@@ -1199,9 +1245,6 @@ private:
     return sum / count;
   }
 
-  /**
-   *
-   */
   double getAverageAltitude(ros::Time t0, ros::Time t1)
   {
     double sum = 0.0;
@@ -1222,80 +1265,77 @@ private:
     return sum / count;
   }
 
-  /**
-   *
-   */
   gtsam::Pose3 voEstimation()
   {
-    // Aux Variables
     std::vector<cv::Point2f> prevKFPoints, currKFPoints;
 
-    // Establish keyframe point correspondences (by ID)
-    for (size_t i = 0; i < prevKeyframe.points.ids.size(); i++)
+    std::unordered_map<int, cv::Point2f> currPointMap;
+    currPointMap.reserve(currKeyframe.points.ids.size());
+
+    for (size_t j = 0; j < currKeyframe.points.ids.size(); ++j)
     {
-      int id = prevKeyframe.points.ids[i];
-      auto it = std::find(currKeyframe.points.ids.begin(), currKeyframe.points.ids.end(), id);
-      if (it == currKeyframe.points.ids.end())
-        continue;
-
-      int j = std::distance(currKeyframe.points.ids.begin(), it);
-
-      prevKFPoints.push_back(prevKeyframe.points.pts[i]);
-      currKFPoints.push_back(currKeyframe.points.pts[j]);
+      currPointMap[currKeyframe.points.ids[j]] = currKeyframe.points.pts[j];
     }
 
-    // Defensive checks
+    for (size_t i = 0; i < prevKeyframe.points.ids.size(); ++i)
+    {
+      int id = prevKeyframe.points.ids[i];
+      auto it = currPointMap.find(id);
+      if (it == currPointMap.end())
+        continue;
+
+      prevKFPoints.push_back(prevKeyframe.points.pts[i]);
+      currKFPoints.push_back(it->second);
+    }
+
     if (prevKFPoints.size() < 8 || currKFPoints.size() < 8)
     {
       WARN("[VO Estimation] Not enough feature correspondences for essential matrix.");
-      return gtsam::Pose3(); // Identity by default
+      return gtsam::Pose3();
     }
 
-    // Compute Essential Matrix
     cv::Mat inlierMask;
     cv::Mat E = cv::findEssentialMat(prevKFPoints, currKFPoints, K, cv::RANSAC, 0.999, 1.0, inlierMask);
 
     if (E.empty())
     {
       WARN("[VO Estimation] Essential matrix computation failed.");
-      return gtsam::Pose3(); // Identity
+      return gtsam::Pose3();
     }
 
-    // Recover relative pose from Essential matrix
     cv::Mat R, t;
     int inliers = cv::recoverPose(E, prevKFPoints, currKFPoints, K, R, t, inlierMask);
 
     if (inliers < 8)
     {
       WARN("[VO Estimation] Too few inliers after pose recovery.");
-      return gtsam::Pose3(); // Identity
+      return gtsam::Pose3();
     }
 
-    // Convert to gtsam::Pose3
-    // OpenCV Mat (3x3) → Eigen::Matrix3d
     Eigen::Matrix3d R_eigen;
     Eigen::Vector3d t_eigen;
-
     cv::cv2eigen(R, R_eigen);
     cv::cv2eigen(t, t_eigen);
 
-    gtsam::Rot3 rot = gtsam::Rot3(R_eigen);
-    gtsam::Point3 trans = gtsam::Point3(t_eigen);
-
-    gtsam::Pose3 relativePose(rot, trans);
+    gtsam::Rot3 rot(R_eigen);
+    gtsam::Point3 trans(t_eigen.x(), t_eigen.y(), t_eigen.z());
 
     OK("[VO Estimation] Relative pose computed with " << inliers << " inliers.");
-    return relativePose;
+    return gtsam::Pose3(rot, trans);
   }
 
-  /**
-   *
-   */
   bool poseEstimation()
   {
     if (!hasFirstKF)
     {
       WARN("[poseEstimation]: No keyframes available.");
+      return false;
+    }
+
+    // must have a previous KF to estimate between
+    if (prevKeyframe.index < 0 || currKeyframe.index <= prevKeyframe.index)
+    {
+      WARN("[poseEstimation]: Need at least 2 keyframes (prev invalid or curr not newer).");
       return false;
     }
 
@@ -1305,7 +1345,6 @@ private:
       return false;
     }
 
-    // === Time Interval ===
     ros::Time t0 = prevKeyframe.timestamp;
     ros::Time t1 = currKeyframe.timestamp;
     double dt = (t1 - t0).toSec();
@@ -1316,49 +1355,77 @@ private:
       return false;
     }
 
-    // === Inertial Priors ===
+    // Inertial priors
     Eigen::Quaterniond quat = getInterpolatedQuat(t1);
     Eigen::Vector3d avgVel = getAverageVelocity(t0, t1);
-    double avgAlt = getAverageAltitude(t0, t1);
+    double avgAltRel = getAverageAltitude(t0, t1); // RELATIVE altitude now
     Eigen::Vector3d delta_translation = avgVel * dt;
 
-    // === VO Estimation ===
+    // VO estimation
     gtsam::Pose3 relativePose = voEstimation();
 
-    // === GTSAM Symbols ===
+    // --- SCALE VO TRANSLATION USING VELOCITY MAGNITUDE ---
+    {
+      Eigen::Vector3d t_vo(relativePose.translation().x(),
+                           relativePose.translation().y(),
+                           relativePose.translation().z());
+
+      double scale = delta_translation.norm(); // meters
+      if (t_vo.norm() > 1e-9 && scale > 1e-4)
+      {
+        Eigen::Vector3d t_scaled = t_vo.normalized() * scale;
+
+        // Fix sign ambiguity using velocity direction
+        if (t_scaled.dot(delta_translation) < 0)
+          t_scaled = -t_scaled;
+
+        relativePose = gtsam::Pose3(relativePose.rotation(),
+                                    gtsam::Point3(t_scaled.x(), t_scaled.y(), t_scaled.z()));
+      }
+    }
+
     gtsam::Symbol prevSym('x', prevKeyframe.index);
     gtsam::Symbol currSym('x', currKeyframe.index);
 
-    // === Add VO Between Factor ===
+    // Get previous pose (must exist)
+    gtsam::Pose3 prevPose = isam.calculateEstimate().at<gtsam::Pose3>(prevSym);
+
+    // Initial estimate for curr pose (curr key is new)
+    gtsam::Pose3 currPoseGuess = prevPose.compose(relativePose);
+
+    // VO Between factor
     auto voNoise = gtsam::noiseModel::Diagonal::Sigmas(
         (gtsam::Vector(6) << VO_NOISE_ROT, VO_NOISE_ROT, VO_NOISE_ROT,
          VO_NOISE_TRANS, VO_NOISE_TRANS, VO_NOISE_TRANS)
             .finished());
-
-    gtsam::Pose3 prevPose = isam.calculateEstimate().at<gtsam::Pose3>(prevSym);
     graph.add(gtsam::BetweenFactor<gtsam::Pose3>(prevSym, currSym, relativePose, voNoise));
 
-    // === Orientation Prior (from IMU) ===
+    // Orientation prior
     gtsam::Rot3 rotPrior(quat);
     auto rotNoise = gtsam::noiseModel::Isotropic::Sigma(3, ROT_PRIOR_NOISE);
     graph.add(gtsam::PoseRotationPrior<gtsam::Pose3>(currSym, rotPrior, rotNoise));
 
-    // === Velocity-Based Translation Prior ===
-    gtsam::Point3 expectedTrans = prevPose.translation() + gtsam::Point3(delta_translation);
+    // Velocity translation prior (full xyz)
+    gtsam::Point3 expectedTrans = prevPose.translation() +
+                                  gtsam::Point3(delta_translation.x(), delta_translation.y(), delta_translation.z());
     auto transNoise = gtsam::noiseModel::Isotropic::Sigma(3, TRANS_PRIOR_NOISE);
     graph.add(gtsam::PoseTranslationPrior<gtsam::Pose3>(currSym, expectedTrans, transNoise));
 
-    // === Altitude Prior (Z only) ===
-    gtsam::Point3 zOnly(0.0, 0.0, avgAlt);
+    // Altitude prior (Z only): keep x/y from expectedTrans, constrain z
+    gtsam::Point3 altPrior(expectedTrans.x(), expectedTrans.y(), avgAltRel);
     auto altNoise = gtsam::noiseModel::Diagonal::Sigmas(
         (gtsam::Vector(3) << 1e6, 1e6, ALT_PRIOR_NOISE).finished());
-    graph.add(gtsam::PoseTranslationPrior<gtsam::Pose3>(currSym, zOnly, altNoise));
+    graph.add(gtsam::PoseTranslationPrior<gtsam::Pose3>(currSym, altPrior, altNoise));
 
-    // === GPS Factor Every N Keyframes ===
-    if (currKeyframe.index % GPS_PRIOR_INTERVAL == 0)
+    // ==========================
+    // GPS factor every N keyframes
+    // ==========================
+    bool gpsUsed = false;
+    Eigen::Vector3d gpsVec(0.0, 0.0, 0.0);
+
+    if (GPS_PRIOR_INTERVAL > 0 && (currKeyframe.index % GPS_PRIOR_INTERVAL == 0))
     {
-      // Find closest ENU reading
-      double minDiff = 1e6;
+      double minDiff = 1e9;
       ENU closestGps;
       bool found = false;
 
@@ -1373,12 +1440,39 @@ private:
         }
       }
 
-      if (found)
+      // Optional: time gating (recommended)
+      // If your GPS is low-rate, pick a reasonable threshold like 0.2~0.3s
+      const double GPS_MAX_DT = 0.25;
+
+      if (found && minDiff <= GPS_MAX_DT)
       {
         gtsam::Point3 gps_meas(closestGps.x, closestGps.y, closestGps.z);
-        auto gpsNoise = gtsam::noiseModel::Isotropic::Sigma(3, GPS_NOISE);
+        gpsVec = Eigen::Vector3d(gps_meas.x(), gps_meas.y(), gps_meas.z());
+        gpsUsed = true;
+
+        // "Before" should compare GPS to the curr initial guess (not prevPose)
+        Eigen::Vector3d before(currPoseGuess.translation().x(),
+                               currPoseGuess.translation().y(),
+                               currPoseGuess.translation().z());
+
+        INFO("[GPS DEBUG] Before update | ||pose_guess - gps|| = "
+             << (before - gpsVec).norm() << " m");
+
+        // Use Isotropic or (recommended) Diagonal noise
+        // auto gpsNoise = gtsam::noiseModel::Isotropic::Sigma(3, GPS_NOISE);
+
+        auto gpsNoise = gtsam::noiseModel::Diagonal::Sigmas(
+            (gtsam::Vector(3) << GPS_NOISE, GPS_NOISE, GPS_NOISE).finished());
+
         graph.add(gtsam::GPSFactor(currSym, gps_meas, gpsNoise));
-        OK("[GPS Factor] Added at keyframe " << currKeyframe.index);
+
+        OK("[GPS Factor] Added at keyframe " << currKeyframe.index
+                                             << " (dt=" << minDiff << "s)");
+      }
+      else if (found)
+      {
+        WARN("[GPS Factor] Closest GPS too far in time (dt=" << minDiff
+                                                             << "s). Skipping factor.");
       }
       else
       {
@@ -1386,24 +1480,31 @@ private:
       }
     }
 
-    // === Initial Estimate ===
-    gtsam::Pose3 currPoseGuess = prevPose.compose(relativePose);
-    if (!values.exists(currSym))
-    {
-      values.insert(currSym, currPoseGuess);
-    }
+    // Insert initial estimate for current key
+    values.insert(currSym, currPoseGuess);
 
-    // === ISAM2 Update ===
+    // ISAM2 Update
     isam.update(graph, values);
     isam.update();
     graph.resize(0);
     values.clear();
 
-    // === Save Optimized Pose ===
+    // Save optimized pose
     gtsam::Pose3 optimizedPose = isam.calculateEstimate().at<gtsam::Pose3>(currSym);
     currKeyframe.pose = optimizedPose;
 
-    // === Publish Pose ===
+    // GPS debug AFTER update (only if we actually used GPS)
+    if (gpsUsed)
+    {
+      Eigen::Vector3d after(optimizedPose.translation().x(),
+                            optimizedPose.translation().y(),
+                            optimizedPose.translation().z());
+
+      INFO("[GPS DEBUG] After update  | ||pose_opt - gps||   = "
+           << (after - gpsVec).norm() << " m");
+    }
+
+    // Publish pose
     geometry_msgs::PoseStamped poseMsg;
     poseMsg.header.stamp = currKeyframe.timestamp;
     poseMsg.header.frame_id = "map";
@@ -1416,7 +1517,7 @@ private:
     poseMsg.pose.orientation.w = optimizedPose.rotation().toQuaternion().w();
     posePub.publish(poseMsg);
 
-    // === Publish Path ===
+    // Publish path
     pathMsg.header = poseMsg.header;
     pathMsg.poses.push_back(poseMsg);
     pathPub.publish(pathMsg);
