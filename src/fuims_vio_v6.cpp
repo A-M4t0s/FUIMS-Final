@@ -75,6 +75,12 @@
 // =========================================================
 //  Enum
 // =========================================================
+/**
+ * VIO State Machine
+ * - IDLE: waiting for start command
+ * - RUNNING: processing frames
+ * - RESET: reset all variables to default
+ */
 enum class vioState
 {
   IDLE = 0,
@@ -85,12 +91,24 @@ enum class vioState
 // =========================================================
 //  Data Structures
 // =========================================================
+/**
+ * Image Frame Structure
+ * @param image: Undistorted image frame
+ * @param timestamp: ROS timestamp of the image frame
+ */
 struct ImageFrame
 {
   cv::Mat image;
   ros::Time timestamp;
 };
 
+/**
+ * Points Structure
+ * @param ids: Unique IDs for each feature point
+ * @param pts: 2D coordinates of each feature point
+ * @param isTracked: Boolean flags indicating if the point is currently tracked
+ * @param age: Age of each feature point in frames
+ */
 struct Points
 {
   std::vector<int> ids;
@@ -99,6 +117,15 @@ struct Points
   std::vector<int> age;
 };
 
+/**
+ * Keyframe Structure
+ * @param index: Keyframe index
+ * @param timestamp: ROS timestamp of the keyframe
+ * @param image: Undistorted image of the keyframe
+ * @param frameID: Original frame index from which the keyframe was created
+ * @param points: Feature points associated with the keyframe
+ * @param pose: Estimated pose of the keyframe (gtsam::Pose3)
+ */
 struct Keyframe
 {
   int index;
@@ -109,12 +136,23 @@ struct Keyframe
   gtsam::Pose3 pose;
 };
 
+/** * ENU Structure
+ * @param timestamp: ROS timestamp of the GPS fix
+ * @param x: East coordinate
+ * @param y: North coordinate
+ * @param z: Up coordinate
+ */
 struct ENU
 {
   ros::Time timestamp;
   double x, y, z;
 };
 
+/**
+ * Barometric Altitude Structure
+ * @param timestamp: ROS timestamp of the altitude measurement
+ * @param altitude: Altitude value (stored as RELATIVE altitude in ENU frame)
+ */
 struct BaroAltitude
 {
   ros::Time timestamp;
@@ -146,6 +184,18 @@ constexpr double e2 = 1 - (b * b) / (a * a);
 // =========================================================
 // Referential Coordinate Conversion Functions
 // =========================================================
+/**
+ * Convert geodetic coordinates (lat, lon, alt) to ECEF coordinates (X, Y, Z).
+ * @param lat: Latitude in radians
+ * @param lon: Longitude in radians
+ * @param alt: Altitude in meters
+ * @param X: Output ECEF X coordinate
+ * @param Y: Output ECEF Y coordinate
+ * @param Z: Output ECEF Z coordinate
+ *
+ * IMPORTANT NOTE:
+ * - lat/lon MUST be in RADIANS when calling this function.
+ */
 void geodeticToECEF(double lat, double lon, double alt, double &X, double &Y, double &Z)
 {
   // lat/lon MUST be in radians
@@ -159,6 +209,19 @@ void geodeticToECEF(double lat, double lon, double alt, double &X, double &Y, do
   Z = (b * b / (a * a) * N + alt) * sinLat;
 }
 
+/**
+ * Convert ECEF coordinates (X, Y, Z) to ENU coordinates (x, y, z) relative to a reference point (lat0, lon0, alt0).
+ * @param X: ECEF X coordinate
+ * @param Y: ECEF Y coordinate
+ * @param Z: ECEF Z coordinate
+ * @param lat0: Reference latitude in radians
+ * @param lon0: Reference longitude in radians
+ * @param alt0: Reference altitude in meters
+ * @return ENU structure containing the converted coordinates
+ *
+ * IMPORTANT NOTE:
+ * - lat0/lon0 MUST be in RADIANS when calling this function.
+ */
 ENU ecefToENU(double X, double Y, double Z, double lat0, double lon0, double alt0)
 {
   double X0, Y0, Z0;
@@ -219,23 +282,26 @@ public:
     // =========================================================
     // Setup
     // =========================================================
+    // Setup signal handler
     signal(SIGINT, signalHandler);
 
+    // Loading parameters and Dynamic Reconfigure
     loadParams();
-
     drCallback = boost::bind(&vioManager::configCallback, this, _1, _2);
     drServer.setCallback(drCallback);
 
+    // Buffer ROSBAG messages
     bufferRosbagMessages(BAG_PATH);
 
+    // ROS Publishers and Subscribers
     matchingPub = nh.advertise<sensor_msgs::Image>("vio/feature_matches", 1);
     featurePub = nh.advertise<sensor_msgs::Image>("vio/feature_ages", 1);
     posePub = nh.advertise<geometry_msgs::PoseStamped>("vio/pose", 1);
     pathPub = nh.advertise<nav_msgs::Path>("vio/path", 1);
     gtPathPub = nh.advertise<nav_msgs::Path>("vio/ground_truth", 1, true);
-
     stateSub = nh.subscribe<std_msgs::UInt8>("vio/state", 1, &vioManager::stateCallback, this);
 
+    // Camera Undistortion Maps
     cv::initUndistortRectifyMap(
         K,
         distCoeffs,
@@ -346,6 +412,7 @@ private:
   // =========================================================
   // Variables
   // =========================================================
+  // ROS Variables
   ros::NodeHandle nh;
   ros::Publisher matchingPub, featurePub, posePub, pathPub, gtPathPub;
   ros::Subscriber stateSub, resetSub;
@@ -372,7 +439,7 @@ private:
   // === ROS Topic Message Rates ===
   int CAMERA_RATE, INERTIAL_RATE;
 
-  // VO and Inertial Prior Noise
+  // === VO and Inertial Prior Noise ===
   double VO_NOISE_ROT, VO_NOISE_TRANS, ROT_PRIOR_NOISE, TRANS_PRIOR_NOISE, ALT_PRIOR_NOISE, GPS_NOISE;
 
   // ROS Topic Messages Buffers
@@ -425,6 +492,10 @@ private:
   // =========================================================
   // Helpers
   // =========================================================
+  /**
+   * Rebuild the ISAM2 object from scratch, resetting graph and values.
+   * This includes adding the prior factor at x0.
+   */
   void rebuildISAM()
   {
     isam = gtsam::ISAM2(isamParams);
@@ -444,6 +515,9 @@ private:
     values.clear();
   }
 
+  /**
+   * Load parameters from ROS parameter server.
+   */
   void loadParams()
   {
     nh.param("MIN_FEATURES", MIN_FEATURES, 25);
@@ -478,6 +552,10 @@ private:
     nh.param("GPS_NOISE", GPS_NOISE, 1.0);
   }
 
+  /**
+   * Buffer messages from a ROSBAG file into local buffers for processing.
+   * @param bag_path: Path to the ROSBAG file
+   */
   void bufferRosbagMessages(const std::string &bag_path)
   {
     rosbag::Bag bag;
@@ -647,6 +725,9 @@ private:
     OK("Altitude (REL) messages total: " << altBuffer.size());
   }
 
+  /**
+   * Reset all VIO states and variables to default.
+   */
   void statesReset()
   {
     // Core runtime state
@@ -677,6 +758,9 @@ private:
     rebuildISAM();
   }
 
+  /**
+   * Clear the estimated path in RViz.
+   */
   void clearEstimatedPath()
   {
     pathMsg.poses.clear();
@@ -689,11 +773,25 @@ private:
     INFO("[RVIZ] Estimated path cleared.");
   }
 
+  /**
+   * Check if a point is within the valid image area (considering a margin).
+   * @param p: 2D point to check
+   * @param img: Image for boundary reference
+   * @return true if the point is within the valid area, false otherwise
+   */
   bool inImage(const cv::Point2f &p, const cv::Mat &img)
   {
     return p.x >= 16 && p.y >= 16 && p.x < img.cols - 16 && p.y < img.rows - 16;
   }
 
+  /**
+   * Draw feature matches between two images.
+   * @param img1: First image
+   * @param img2: Second image
+   * @param pts1: Feature points in the first image
+   * @param pts2: Corresponding feature points in the second image
+   * @return Visualization image with matches drawn
+   */
   cv::Mat drawFeatureMatches(const cv::Mat &img1, const cv::Mat &img2,
                              const std::vector<cv::Point2f> &pts1,
                              const std::vector<cv::Point2f> &pts2)
@@ -717,6 +815,12 @@ private:
     return vis;
   }
 
+  /**
+   * Draw feature points with colors indicating their ages.
+   * @param img: Image to draw on
+   * @param points: Points structure containing feature points and their ages
+   * @return Visualization image with feature ages drawn
+   */
   cv::Mat drawFeatureAges(const cv::Mat &img, const Points &points)
   {
     cv::Mat vis;
@@ -738,6 +842,9 @@ private:
     return vis;
   }
 
+  /**
+   * Publish debug image showing feature ages.
+   */
   void debugImageFeatureAges()
   {
     if (currFrame.image.empty())
@@ -748,6 +855,9 @@ private:
     featurePub.publish(ageMsg);
   }
 
+  /**
+   * Publish debug image showing feature matches between previous and current frames.
+   */
   void debugImageFeatureMatching()
   {
     if (prevFrame.image.empty() || currFrame.image.empty())
@@ -778,6 +888,9 @@ private:
     matchingPub.publish(matchMsg);
   }
 
+  /**
+   * Start the loop execution timer.
+   */
   void startLoopTimer()
   {
     loopStartWall_ = ros::WallTime::now();
@@ -785,6 +898,9 @@ private:
     INFO("[Execution Timer] Loop timer started.");
   }
 
+  /**
+   * Stop the loop execution timer and report the elapsed time.
+   */
   void stopLoopTimerAndReport()
   {
     if (!loopTimingActive_)
@@ -800,6 +916,11 @@ private:
   // =========================================================
   // Callbacks
   // =========================================================
+  /**
+   * Dynamic Reconfigure callback to update VIO parameters at runtime.
+   * @param config: Configuration object with updated parameters
+   * @param level: Level of change (not used)
+   */
   void configCallback(fuims::vioParamsConfig &config, uint32_t level)
   {
     MAX_FEATURES = config.MAX_FEATURES;
@@ -830,16 +951,17 @@ private:
     ROT_PRIOR_NOISE = config.ROT_PRIOR_NOISE;
     TRANS_PRIOR_NOISE = config.TRANS_PRIOR_NOISE;
     ALT_PRIOR_NOISE = config.ALT_PRIOR_NOISE;
-
-    // NOTE: GPS_NOISE is not present in your config callback originally.
-    // If it's in your .cfg, add it here too.
-    // GPS_NOISE = config.GPS_NOISE;
+    GPS_NOISE = config.GPS_NOISE;
 
     INFO("Dynamic reconfigure updated VIO parameters.");
     WARN("Changing VIO State to RESET");
     vio_state_ = vioState::RESET;
   }
 
+  /**
+   * Callback for VIO state changes.
+   * @param msg: Message containing the new VIO state
+   */
   void stateCallback(const std_msgs::UInt8ConstPtr &msg)
   {
     vioState new_state = static_cast<vioState>(msg->data);
@@ -879,6 +1001,11 @@ private:
   // =========================================================
   // Methods
   // =========================================================
+  /**
+   * Undistort a compressed image message using precomputed maps.
+   * @param msg: Compressed image message
+   * @return Undistorted ImageFrame
+   */
   ImageFrame undistortImage(const sensor_msgs::CompressedImageConstPtr msg)
   {
     ImageFrame frame;
@@ -898,6 +1025,11 @@ private:
     return frame;
   }
 
+  /**
+   * Detect features in an image using the GFTT algorithm.
+   * @param img: Input image
+   * @return Detected Points structure
+   */
   Points featureDetection(const cv::Mat &img)
   {
     Points detectedPoints;
@@ -925,6 +1057,10 @@ private:
     return detectedPoints;
   }
 
+  /**
+   * Track features from the previous frame to the current frame using KLT optical flow.
+   * @return Filtered Points structure with successfully tracked features
+   */
   Points featureTracking()
   {
     Points filteredPoints;
@@ -962,6 +1098,10 @@ private:
     return filteredPoints;
   }
 
+  /**
+   * Replenish features in the current frame to maintain a desired number of features.
+   * @param img: Current image
+   */
   void replenishFeatures(const cv::Mat &img)
   {
     int featuresToAdd = MAX_FEATURES - static_cast<int>(currPoints.pts.size());
@@ -1005,6 +1145,10 @@ private:
     }
   }
 
+  /**
+   * Frame processing: detect and track features between frames.
+   * @return true if a current frame is successfully processed, false otherwise
+   */
   bool frameProcessing()
   {
     if (isFirstFrame)
@@ -1044,6 +1188,12 @@ private:
     return true;
   }
 
+  /**
+   * Compute the average parallax between matched feature points in two sets.
+   * @param kfPoints: Points from the keyframe
+   * @param framePoints: Points from the current frame
+   * @return Average parallax value
+   */
   double computeParallax(Points kfPoints, Points framePoints)
   {
     if (kfPoints.ids.size() != kfPoints.pts.size())
@@ -1087,7 +1237,8 @@ private:
   }
 
   /**
-   * Keyframe processing: now returns TRUE ONLY when a new keyframe is created.
+   * Keyframe processing: determine if the current frame should be a keyframe.
+   * @return true if a new keyframe is created, false otherwise
    */
   bool keyframeProcessing()
   {
@@ -1176,6 +1327,11 @@ private:
     return true;
   }
 
+  /**
+   * Interpolate quaternion at a given timestamp using the quaternion buffer.
+   * @param time: Timestamp to interpolate at
+   * @return Interpolated Eigen::Quaterniond
+   */
   Eigen::Quaterniond getInterpolatedQuat(ros::Time time)
   {
     if (quatBuffer.size() < 2)
@@ -1225,6 +1381,12 @@ private:
         .normalized();
   }
 
+  /**
+   * Compute the average velocity between two timestamps using the velocity buffer.
+   * @param t0: Start timestamp
+   * @param t1: End timestamp
+   * @return Average velocity as an Eigen::Vector3d
+   */
   Eigen::Vector3d getAverageVelocity(ros::Time t0, ros::Time t1)
   {
     Eigen::Vector3d sum(0, 0, 0);
@@ -1245,6 +1407,12 @@ private:
     return sum / count;
   }
 
+  /**
+   * Compute the average altitude between two timestamps using the altitude buffer.
+   * @param t0: Start timestamp
+   * @param t1: End timestamp
+   * @return Average altitude as a double
+   */
   double getAverageAltitude(ros::Time t0, ros::Time t1)
   {
     double sum = 0.0;
@@ -1265,6 +1433,10 @@ private:
     return sum / count;
   }
 
+  /**
+   * Perform visual odometry estimation between the previous and current keyframes.
+   * @return Estimated relative pose as gtsam::Pose3
+   */
   gtsam::Pose3 voEstimation()
   {
     std::vector<cv::Point2f> prevKFPoints, currKFPoints;
@@ -1324,6 +1496,10 @@ private:
     return gtsam::Pose3(rot, trans);
   }
 
+  /**
+   * Perform pose estimation using visual odometry and inertial priors.
+   * @return true if pose estimation is successful, false otherwise
+   */
   bool poseEstimation()
   {
     if (!hasFirstKF)
