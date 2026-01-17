@@ -272,6 +272,161 @@ Eigen::Quaterniond convertNEDtoENU(const Eigen::Quaterniond &q_ned)
 }
 
 // =========================================================
+// TrajectoryEvaluator Class
+// =========================================================
+class TrajectoryEvaluator
+{
+public:
+  /**
+   * Add a pose estimate (no GPS association here anymore).
+   */
+  void addPose(const ros::Time &stamp, const gtsam::Pose3 &estPose)
+  {
+    Eigen::Vector3d p_est(estPose.translation().x(),
+                          estPose.translation().y(),
+                          estPose.translation().z());
+
+    estPositions_.push_back(p_est);
+    estTimestamps_.push_back(stamp);
+  }
+
+  /**
+   * Compute and print RMSE and MAX position errors (uses simple nearest-neighbor for console output).
+   */
+  void computeMetrics(const std::deque<ENU> &gpsEnuBuffer, double maxGpsDt = 0.25)
+  {
+    if (estPositions_.empty())
+    {
+      ERROR("[TrajectoryEvaluator] No estimated poses to evaluate.");
+      return;
+    }
+
+    double sumSq = 0.0;
+    double maxErr = 0.0;
+    int validCount = 0;
+
+    for (size_t i = 0; i < estPositions_.size(); ++i)
+    {
+      // Find closest GPS
+      double minDt = 1e9;
+      Eigen::Vector3d p_gt;
+      for (const auto &enu : gpsEnuBuffer)
+      {
+        double dt = std::abs((enu.timestamp - estTimestamps_[i]).toSec());
+        if (dt < minDt)
+        {
+          minDt = dt;
+          p_gt = Eigen::Vector3d(enu.x, enu.y, enu.z);
+        }
+      }
+
+      if (minDt < maxGpsDt)
+      {
+        Eigen::Vector3d err = estPositions_[i] - p_gt;
+        double norm = err.norm();
+        sumSq += norm * norm;
+        if (norm > maxErr)
+          maxErr = norm;
+        validCount++;
+      }
+    }
+
+    if (validCount == 0)
+    {
+      ERROR("[TrajectoryEvaluator] No valid pose-GPS matches found.");
+      return;
+    }
+
+    double rmse = std::sqrt(sumSq / validCount);
+
+    OK("[TrajectoryEvaluator] Pose Evaluation:");
+    OK("  APE RMSE: " << std::fixed << std::setprecision(3) << rmse << " m");
+    OK("  APE MAX:  " << std::fixed << std::setprecision(3) << maxErr << " m");
+    OK("  Samples:  " << validCount << " / " << estPositions_.size());
+  }
+
+  /**
+   * Write trajectory data to a CSV file.
+   * Writes estimated poses AND full GPS ground truth separately.
+   */
+  void writeCSVWithParams(const std::unordered_map<std::string, std::string> &params,
+                          const std::deque<ENU> &gpsEnuBuffer)
+  {
+    const std::string dir = "/home/tony/Desktop/MEEC-SA/2º Ano/FUIMS/Resultados/";
+
+    // Get current time
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    std::tm *tm_ptr = std::localtime(&now_time);
+
+    std::ostringstream oss;
+    oss << "vio_results_"
+        << std::put_time(tm_ptr, "%Y-%m-%d_%H-%M-%S")
+        << ".csv";
+
+    std::string filename = dir + oss.str();
+
+    std::ofstream file(filename);
+    if (!file.is_open())
+    {
+      ERROR("[TrajectoryEvaluator] Failed to open file: " << filename);
+      return;
+    }
+
+    // --- Write parameters ---
+    file << "# ========== VIO PARAMETERS ==========\n";
+    for (const auto &[key, value] : params)
+    {
+      file << "# " << key << ": " << value << "\n";
+    }
+    file << "# ====================================\n";
+    file << "\n";
+
+    // --- Write ESTIMATED trajectory ---
+    file << "# ========== ESTIMATED TRAJECTORY ==========\n";
+    file << "est_timestamp,est_x,est_y,est_z\n";
+    for (size_t i = 0; i < estPositions_.size(); ++i)
+    {
+      file << std::fixed << std::setprecision(6)
+           << estTimestamps_[i].toSec() << ","
+           << estPositions_[i].x() << "," 
+           << estPositions_[i].y() << "," 
+           << estPositions_[i].z() << "\n";
+    }
+
+    file << "\n";
+
+    // --- Write GROUND TRUTH (full GPS) trajectory ---
+    file << "# ========== GROUND TRUTH TRAJECTORY ==========\n";
+    file << "gt_timestamp,gt_x,gt_y,gt_z\n";
+    for (const auto &enu : gpsEnuBuffer)
+    {
+      file << std::fixed << std::setprecision(6)
+           << enu.timestamp.toSec() << ","
+           << enu.x << "," 
+           << enu.y << "," 
+           << enu.z << "\n";
+    }
+
+    file.close();
+    OK("[TrajectoryEvaluator] CSV written to: " << filename);
+  }
+
+  /**
+   * Clear all stored trajectory data.
+   */
+  void clear()
+  {
+    estPositions_.clear();
+    estTimestamps_.clear();
+  }
+
+private:
+  std::vector<Eigen::Vector3d> estPositions_;
+  std::vector<ros::Time> estTimestamps_;
+};
+
+// =========================================================
 // VIO Manager Class
 // =========================================================
 class vioManager
@@ -356,6 +511,10 @@ public:
         {
           stopLoopTimerAndReport();
           OK("[VIO Manager] Processing Ended! Changing state to RESET");
+
+          evaluator_.computeMetrics(gpsEnuBuffer);
+          evaluator_.writeCSVWithParams(paramLog_, gpsEnuBuffer);
+
           vio_state_ = vioState::RESET;
         }
         else
@@ -489,6 +648,10 @@ private:
   gtsam::NonlinearFactorGraph graph;
   gtsam::Values values;
 
+  // Trajectory Evaluator
+  TrajectoryEvaluator evaluator_;
+  std::unordered_map<std::string, std::string> paramLog_;
+
   // =========================================================
   // Helpers
   // =========================================================
@@ -550,6 +713,34 @@ private:
     nh.param("TRANS_PRIOR_NOISE", TRANS_PRIOR_NOISE, 0.1);
     nh.param("ALT_PRIOR_NOISE", ALT_PRIOR_NOISE, 0.5);
     nh.param("GPS_NOISE", GPS_NOISE, 1.0);
+
+    paramLog_ = {
+        {"MAX_FEATURES", std::to_string(MAX_FEATURES)},
+        {"MIN_FEATURES", std::to_string(MIN_FEATURES)},
+        {"MIN_TRACKED_FEATURES", std::to_string(MIN_TRACKED_FEATURES)},
+        {"MAX_TRACKING_ERROR_PX", std::to_string(MAX_TRACKING_ERROR_PX)},
+        {"MAX_TRACKING_AGE", std::to_string(MAX_TRACKING_AGE)},
+        {"KF_FEATURE_THRESHOLD", std::to_string(KF_FEATURE_THRESHOLD)},
+        {"KF_PARALLAX_THRESHOLD", std::to_string(KF_PARALLAX_THRESHOLD)},
+        {"GPS_PRIOR_INTERVAL", std::to_string(GPS_PRIOR_INTERVAL)},
+        {"GFTT_MAX_FEATURES", std::to_string(GFTT_MAX_FEATURES)},
+        {"GFTT_BLOCK_SIZE", std::to_string(GFTT_BLOCK_SIZE)},
+        {"GFTT_QUALITY", std::to_string(GFTT_QUALITY)},
+        {"GFTT_MIN_DIST", std::to_string(GFTT_MIN_DIST)},
+        {"KLT_MAX_LEVEL", std::to_string(KLT_MAX_LEVEL)},
+        {"KLT_ITERS", std::to_string(KLT_ITERS)},
+        {"KLT_BORDER_MARGIN", std::to_string(KLT_BORDER_MARGIN)},
+        {"KLT_EPS", std::to_string(KLT_EPS)},
+        {"KLT_MIN_EIG", std::to_string(KLT_MIN_EIG)},
+        {"KLT_FB_THRESH_PX", std::to_string(KLT_FB_THRESH_PX)},
+        {"CAMERA_RATE", std::to_string(CAMERA_RATE)},
+        {"INERTIAL_RATE", std::to_string(INERTIAL_RATE)},
+        {"VO_NOISE_ROT", std::to_string(VO_NOISE_ROT)},
+        {"VO_NOISE_TRANS", std::to_string(VO_NOISE_TRANS)},
+        {"ROT_PRIOR_NOISE", std::to_string(ROT_PRIOR_NOISE)},
+        {"TRANS_PRIOR_NOISE", std::to_string(TRANS_PRIOR_NOISE)},
+        {"ALT_PRIOR_NOISE", std::to_string(ALT_PRIOR_NOISE)},
+        {"GPS_NOISE", std::to_string(GPS_NOISE)}};
   }
 
   /**
@@ -754,6 +945,9 @@ private:
     pathMsg.poses.clear();
     pathMsg.header.frame_id = "map";
 
+    // Reset trajectory evaluator (IMPORTANT: prevents duplicate data in CSV)
+    evaluator_.clear();
+
     // Reset optimizer (VERY IMPORTANT)
     rebuildISAM();
   }
@@ -952,6 +1146,34 @@ private:
     TRANS_PRIOR_NOISE = config.TRANS_PRIOR_NOISE;
     ALT_PRIOR_NOISE = config.ALT_PRIOR_NOISE;
     GPS_NOISE = config.GPS_NOISE;
+
+    paramLog_ = {
+        {"MAX_FEATURES", std::to_string(MAX_FEATURES)},
+        {"MIN_FEATURES", std::to_string(MIN_FEATURES)},
+        {"MIN_TRACKED_FEATURES", std::to_string(MIN_TRACKED_FEATURES)},
+        {"MAX_TRACKING_ERROR_PX", std::to_string(MAX_TRACKING_ERROR_PX)},
+        {"MAX_TRACKING_AGE", std::to_string(MAX_TRACKING_AGE)},
+        {"KF_FEATURE_THRESHOLD", std::to_string(KF_FEATURE_THRESHOLD)},
+        {"KF_PARALLAX_THRESHOLD", std::to_string(KF_PARALLAX_THRESHOLD)},
+        {"GPS_PRIOR_INTERVAL", std::to_string(GPS_PRIOR_INTERVAL)},
+        {"GFTT_MAX_FEATURES", std::to_string(GFTT_MAX_FEATURES)},
+        {"GFTT_BLOCK_SIZE", std::to_string(GFTT_BLOCK_SIZE)},
+        {"GFTT_QUALITY", std::to_string(GFTT_QUALITY)},
+        {"GFTT_MIN_DIST", std::to_string(GFTT_MIN_DIST)},
+        {"KLT_MAX_LEVEL", std::to_string(KLT_MAX_LEVEL)},
+        {"KLT_ITERS", std::to_string(KLT_ITERS)},
+        {"KLT_BORDER_MARGIN", std::to_string(KLT_BORDER_MARGIN)},
+        {"KLT_EPS", std::to_string(KLT_EPS)},
+        {"KLT_MIN_EIG", std::to_string(KLT_MIN_EIG)},
+        {"KLT_FB_THRESH_PX", std::to_string(KLT_FB_THRESH_PX)},
+        {"CAMERA_RATE", std::to_string(CAMERA_RATE)},
+        {"INERTIAL_RATE", std::to_string(INERTIAL_RATE)},
+        {"VO_NOISE_ROT", std::to_string(VO_NOISE_ROT)},
+        {"VO_NOISE_TRANS", std::to_string(VO_NOISE_TRANS)},
+        {"ROT_PRIOR_NOISE", std::to_string(ROT_PRIOR_NOISE)},
+        {"TRANS_PRIOR_NOISE", std::to_string(TRANS_PRIOR_NOISE)},
+        {"ALT_PRIOR_NOISE", std::to_string(ALT_PRIOR_NOISE)},
+        {"GPS_NOISE", std::to_string(GPS_NOISE)}};
 
     INFO("Dynamic reconfigure updated VIO parameters.");
     WARN("Changing VIO State to RESET");
@@ -1668,6 +1890,9 @@ private:
     // Save optimized pose
     gtsam::Pose3 optimizedPose = isam.calculateEstimate().at<gtsam::Pose3>(currSym);
     currKeyframe.pose = optimizedPose;
+
+    // Add pose to trajectory evaluator for metrics computation
+    evaluator_.addPose(currKeyframe.timestamp, optimizedPose);
 
     // GPS debug AFTER update (only if we actually used GPS)
     if (gpsUsed)
