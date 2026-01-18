@@ -168,6 +168,7 @@ add_executable(fuims_final src/fuims_vio_v2.cpp)
 add_executable(fuims_tester src/fuims_vio_v4.cpp)
 add_executable(fuims_V2 src/fuims_vio_v6.cpp)
 add_executable(bag_updater src/rosbag_correction.cpp)
+add_executable(vio_state_publisher src/vio_state_publisher.cpp)
 
 ## Rename C++ executable without prefix
 ## The above recommended prefix causes long target names, the following renames the
@@ -182,6 +183,7 @@ add_dependencies(fuims_final ${catkin_EXPORTED_TARGETS})
 add_dependencies(fuims_tester ${catkin_EXPORTED_TARGETS})
 add_dependencies(fuims_V2 ${catkin_EXPORTED_TARGETS})
 add_dependencies(bag_updater ${catkin_EXPORTED_TARGETS})
+add_dependencies(vio_state_publisher ${catkin_EXPORTED_TARGETS})
 
 ## Specify libraries to link a library or executable target against
 # target_link_libraries(${PROJECT_NAME}_node
@@ -206,6 +208,10 @@ target_link_libraries(fuims_V2
 )
 
 target_link_libraries(bag_updater
+  ${catkin_LIBRARIES}
+)
+
+target_link_libraries(vio_state_publisher
   ${catkin_LIBRARIES}
 )
 
@@ -242,6 +248,10 @@ install(TARGETS fuims_V2
 )
 
 install(TARGETS bag_updater
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(TARGETS vio_state_publisher
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
