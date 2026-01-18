@@ -389,8 +389,8 @@ public:
     {
       file << std::fixed << std::setprecision(6)
            << estTimestamps_[i].toSec() << ","
-           << estPositions_[i].x() << "," 
-           << estPositions_[i].y() << "," 
+           << estPositions_[i].x() << ","
+           << estPositions_[i].y() << ","
            << estPositions_[i].z() << "\n";
     }
 
@@ -403,8 +403,8 @@ public:
     {
       file << std::fixed << std::setprecision(6)
            << enu.timestamp.toSec() << ","
-           << enu.x << "," 
-           << enu.y << "," 
+           << enu.x << ","
+           << enu.y << ","
            << enu.z << "\n";
     }
 
@@ -585,6 +585,7 @@ private:
   int MAX_FEATURES, MIN_FEATURES, MIN_TRACKED_FEATURES, MAX_TRACKING_AGE,
       KF_FEATURE_THRESHOLD, KF_PARALLAX_THRESHOLD, GPS_PRIOR_INTERVAL;
   float MAX_TRACKING_ERROR_PX;
+  bool GPS_PRIOR_ENABLE;
 
   // === GFTT Parameters ===
   int GFTT_MAX_FEATURES, GFTT_BLOCK_SIZE;
@@ -598,8 +599,19 @@ private:
   // === ROS Topic Message Rates ===
   int CAMERA_RATE, INERTIAL_RATE;
 
-  // === VO and Inertial Prior Noise ===
-  double VO_NOISE_ROT, VO_NOISE_TRANS, ROT_PRIOR_NOISE, TRANS_PRIOR_NOISE, ALT_PRIOR_NOISE, GPS_NOISE;
+  // === VO Noise (per-axis) ===
+  double VO_NOISE_ROT_X, VO_NOISE_ROT_Y, VO_NOISE_ROT_Z;
+  double VO_NOISE_TRANS_X, VO_NOISE_TRANS_Y, VO_NOISE_TRANS_Z;
+
+  // === Inertial Prior Noise (per-axis) ===
+  double ROT_PRIOR_NOISE_X, ROT_PRIOR_NOISE_Y, ROT_PRIOR_NOISE_Z;
+  double TRANS_PRIOR_NOISE_X, TRANS_PRIOR_NOISE_Y, TRANS_PRIOR_NOISE_Z;
+
+  // === GPS Noise (per-axis) ===
+  double GPS_NOISE_X, GPS_NOISE_Y, GPS_NOISE_Z;
+
+  // === Altitude Prior Noise ===
+  double ALT_PRIOR_NOISE;
 
   // ROS Topic Messages Buffers
   std::deque<sensor_msgs::CompressedImageConstPtr> imgBuffer;
@@ -691,6 +703,7 @@ private:
     nh.param("KF_FEATURE_THRESHOLD", KF_FEATURE_THRESHOLD, 75);
     nh.param("KF_PARALLAX_THRESHOLD", KF_PARALLAX_THRESHOLD, 28);
     nh.param("GPS_PRIOR_INTERVAL", GPS_PRIOR_INTERVAL, 10);
+    nh.param("GPS_PRIOR_ENABLE", GPS_PRIOR_ENABLE, true);
 
     nh.param("GFTT_MAX_FEATURES", GFTT_MAX_FEATURES, 500);
     nh.param("GFTT_BLOCK_SIZE", GFTT_BLOCK_SIZE, 3);
@@ -707,12 +720,29 @@ private:
     nh.param("CAMERA_RATE", CAMERA_RATE, 15);
     nh.param("INERTIAL_RATE", INERTIAL_RATE, 30);
 
-    nh.param("VO_NOISE_ROT", VO_NOISE_ROT, 0.2);
-    nh.param("VO_NOISE_TRANS", VO_NOISE_TRANS, 0.5);
-    nh.param("ROT_PRIOR_NOISE", ROT_PRIOR_NOISE, 0.05);
-    nh.param("TRANS_PRIOR_NOISE", TRANS_PRIOR_NOISE, 0.1);
-    nh.param("ALT_PRIOR_NOISE", ALT_PRIOR_NOISE, 0.5);
-    nh.param("GPS_NOISE", GPS_NOISE, 1.0);
+    // VO Noise (per-axis)
+    nh.param("VO_NOISE_ROT_X", VO_NOISE_ROT_X, 0.2);
+    nh.param("VO_NOISE_ROT_Y", VO_NOISE_ROT_Y, 0.2);
+    nh.param("VO_NOISE_ROT_Z", VO_NOISE_ROT_Z, 0.2);
+    nh.param("VO_NOISE_TRANS_X", VO_NOISE_TRANS_X, 0.5);
+    nh.param("VO_NOISE_TRANS_Y", VO_NOISE_TRANS_Y, 0.5);
+    nh.param("VO_NOISE_TRANS_Z", VO_NOISE_TRANS_Z, 0.5);
+
+    // Inertial Prior Noise (per-axis)
+    nh.param("ROT_PRIOR_NOISE_X", ROT_PRIOR_NOISE_X, 0.05);
+    nh.param("ROT_PRIOR_NOISE_Y", ROT_PRIOR_NOISE_Y, 0.05);
+    nh.param("ROT_PRIOR_NOISE_Z", ROT_PRIOR_NOISE_Z, 0.05);
+    nh.param("TRANS_PRIOR_NOISE_X", TRANS_PRIOR_NOISE_X, 0.1);
+    nh.param("TRANS_PRIOR_NOISE_Y", TRANS_PRIOR_NOISE_Y, 0.1);
+    nh.param("TRANS_PRIOR_NOISE_Z", TRANS_PRIOR_NOISE_Z, 0.1);
+
+    // GPS Noise (per-axis)
+    nh.param("GPS_NOISE_X", GPS_NOISE_X, 1.0);
+    nh.param("GPS_NOISE_Y", GPS_NOISE_Y, 1.0);
+    nh.param("GPS_NOISE_Z", GPS_NOISE_Z, 1.0);
+
+    // Altitude Prior Noise
+    nh.param("ALT_PRIOR_NOISE", ALT_PRIOR_NOISE, 1e6);
 
     paramLog_ = {
         {"MAX_FEATURES", std::to_string(MAX_FEATURES)},
@@ -723,6 +753,7 @@ private:
         {"KF_FEATURE_THRESHOLD", std::to_string(KF_FEATURE_THRESHOLD)},
         {"KF_PARALLAX_THRESHOLD", std::to_string(KF_PARALLAX_THRESHOLD)},
         {"GPS_PRIOR_INTERVAL", std::to_string(GPS_PRIOR_INTERVAL)},
+        {"GPS_PRIOR_ENABLE", GPS_PRIOR_ENABLE ? "true" : "false"},
         {"GFTT_MAX_FEATURES", std::to_string(GFTT_MAX_FEATURES)},
         {"GFTT_BLOCK_SIZE", std::to_string(GFTT_BLOCK_SIZE)},
         {"GFTT_QUALITY", std::to_string(GFTT_QUALITY)},
@@ -735,12 +766,22 @@ private:
         {"KLT_FB_THRESH_PX", std::to_string(KLT_FB_THRESH_PX)},
         {"CAMERA_RATE", std::to_string(CAMERA_RATE)},
         {"INERTIAL_RATE", std::to_string(INERTIAL_RATE)},
-        {"VO_NOISE_ROT", std::to_string(VO_NOISE_ROT)},
-        {"VO_NOISE_TRANS", std::to_string(VO_NOISE_TRANS)},
-        {"ROT_PRIOR_NOISE", std::to_string(ROT_PRIOR_NOISE)},
-        {"TRANS_PRIOR_NOISE", std::to_string(TRANS_PRIOR_NOISE)},
-        {"ALT_PRIOR_NOISE", std::to_string(ALT_PRIOR_NOISE)},
-        {"GPS_NOISE", std::to_string(GPS_NOISE)}};
+        {"VO_NOISE_ROT_X", std::to_string(VO_NOISE_ROT_X)},
+        {"VO_NOISE_ROT_Y", std::to_string(VO_NOISE_ROT_Y)},
+        {"VO_NOISE_ROT_Z", std::to_string(VO_NOISE_ROT_Z)},
+        {"VO_NOISE_TRANS_X", std::to_string(VO_NOISE_TRANS_X)},
+        {"VO_NOISE_TRANS_Y", std::to_string(VO_NOISE_TRANS_Y)},
+        {"VO_NOISE_TRANS_Z", std::to_string(VO_NOISE_TRANS_Z)},
+        {"ROT_PRIOR_NOISE_X", std::to_string(ROT_PRIOR_NOISE_X)},
+        {"ROT_PRIOR_NOISE_Y", std::to_string(ROT_PRIOR_NOISE_Y)},
+        {"ROT_PRIOR_NOISE_Z", std::to_string(ROT_PRIOR_NOISE_Z)},
+        {"TRANS_PRIOR_NOISE_X", std::to_string(TRANS_PRIOR_NOISE_X)},
+        {"TRANS_PRIOR_NOISE_Y", std::to_string(TRANS_PRIOR_NOISE_Y)},
+        {"TRANS_PRIOR_NOISE_Z", std::to_string(TRANS_PRIOR_NOISE_Z)},
+        {"GPS_NOISE_X", std::to_string(GPS_NOISE_X)},
+        {"GPS_NOISE_Y", std::to_string(GPS_NOISE_Y)},
+        {"GPS_NOISE_Z", std::to_string(GPS_NOISE_Z)},
+        {"ALT_PRIOR_NOISE", std::to_string(ALT_PRIOR_NOISE)}};
   }
 
   /**
@@ -927,6 +968,9 @@ private:
     frameIdx = 0;
     keyframeIdx = 0;
     nextFeatureID = 0;
+
+    // Reset state tracking so timer restarts on next RUNNING transition
+    last_vio_state_ = vioState::IDLE;
 
     // Frames / points
     currFrame = ImageFrame();
@@ -1124,6 +1168,7 @@ private:
     KF_FEATURE_THRESHOLD = config.KF_FEATURE_THRESHOLD;
     KF_PARALLAX_THRESHOLD = config.KF_PARALLAX_THRESHOLD;
     GPS_PRIOR_INTERVAL = config.GPS_PRIOR_INTERVAL;
+    GPS_PRIOR_ENABLE = config.GPS_PRIOR_ENABLE;
 
     GFTT_MAX_FEATURES = config.GFTT_MAX_FEATURES;
     GFTT_BLOCK_SIZE = config.GFTT_BLOCK_SIZE;
@@ -1140,12 +1185,29 @@ private:
     CAMERA_RATE = config.CAMERA_RATE;
     INERTIAL_RATE = config.INERTIAL_RATE;
 
-    VO_NOISE_ROT = config.VO_NOISE_ROT;
-    VO_NOISE_TRANS = config.VO_NOISE_TRANS;
-    ROT_PRIOR_NOISE = config.ROT_PRIOR_NOISE;
-    TRANS_PRIOR_NOISE = config.TRANS_PRIOR_NOISE;
+    // VO Noise (per-axis)
+    VO_NOISE_ROT_X = config.VO_NOISE_ROT_X;
+    VO_NOISE_ROT_Y = config.VO_NOISE_ROT_Y;
+    VO_NOISE_ROT_Z = config.VO_NOISE_ROT_Z;
+    VO_NOISE_TRANS_X = config.VO_NOISE_TRANS_X;
+    VO_NOISE_TRANS_Y = config.VO_NOISE_TRANS_Y;
+    VO_NOISE_TRANS_Z = config.VO_NOISE_TRANS_Z;
+
+    // Inertial Prior Noise (per-axis)
+    ROT_PRIOR_NOISE_X = config.ROT_PRIOR_NOISE_X;
+    ROT_PRIOR_NOISE_Y = config.ROT_PRIOR_NOISE_Y;
+    ROT_PRIOR_NOISE_Z = config.ROT_PRIOR_NOISE_Z;
+    TRANS_PRIOR_NOISE_X = config.TRANS_PRIOR_NOISE_X;
+    TRANS_PRIOR_NOISE_Y = config.TRANS_PRIOR_NOISE_Y;
+    TRANS_PRIOR_NOISE_Z = config.TRANS_PRIOR_NOISE_Z;
+
+    // GPS Noise (per-axis)
+    GPS_NOISE_X = config.GPS_NOISE_X;
+    GPS_NOISE_Y = config.GPS_NOISE_Y;
+    GPS_NOISE_Z = config.GPS_NOISE_Z;
+
+    // Altitude Prior Noise
     ALT_PRIOR_NOISE = config.ALT_PRIOR_NOISE;
-    GPS_NOISE = config.GPS_NOISE;
 
     paramLog_ = {
         {"MAX_FEATURES", std::to_string(MAX_FEATURES)},
@@ -1156,6 +1218,7 @@ private:
         {"KF_FEATURE_THRESHOLD", std::to_string(KF_FEATURE_THRESHOLD)},
         {"KF_PARALLAX_THRESHOLD", std::to_string(KF_PARALLAX_THRESHOLD)},
         {"GPS_PRIOR_INTERVAL", std::to_string(GPS_PRIOR_INTERVAL)},
+        {"GPS_PRIOR_ENABLE", GPS_PRIOR_ENABLE ? "true" : "false"},
         {"GFTT_MAX_FEATURES", std::to_string(GFTT_MAX_FEATURES)},
         {"GFTT_BLOCK_SIZE", std::to_string(GFTT_BLOCK_SIZE)},
         {"GFTT_QUALITY", std::to_string(GFTT_QUALITY)},
@@ -1168,12 +1231,22 @@ private:
         {"KLT_FB_THRESH_PX", std::to_string(KLT_FB_THRESH_PX)},
         {"CAMERA_RATE", std::to_string(CAMERA_RATE)},
         {"INERTIAL_RATE", std::to_string(INERTIAL_RATE)},
-        {"VO_NOISE_ROT", std::to_string(VO_NOISE_ROT)},
-        {"VO_NOISE_TRANS", std::to_string(VO_NOISE_TRANS)},
-        {"ROT_PRIOR_NOISE", std::to_string(ROT_PRIOR_NOISE)},
-        {"TRANS_PRIOR_NOISE", std::to_string(TRANS_PRIOR_NOISE)},
-        {"ALT_PRIOR_NOISE", std::to_string(ALT_PRIOR_NOISE)},
-        {"GPS_NOISE", std::to_string(GPS_NOISE)}};
+        {"VO_NOISE_ROT_X", std::to_string(VO_NOISE_ROT_X)},
+        {"VO_NOISE_ROT_Y", std::to_string(VO_NOISE_ROT_Y)},
+        {"VO_NOISE_ROT_Z", std::to_string(VO_NOISE_ROT_Z)},
+        {"VO_NOISE_TRANS_X", std::to_string(VO_NOISE_TRANS_X)},
+        {"VO_NOISE_TRANS_Y", std::to_string(VO_NOISE_TRANS_Y)},
+        {"VO_NOISE_TRANS_Z", std::to_string(VO_NOISE_TRANS_Z)},
+        {"ROT_PRIOR_NOISE_X", std::to_string(ROT_PRIOR_NOISE_X)},
+        {"ROT_PRIOR_NOISE_Y", std::to_string(ROT_PRIOR_NOISE_Y)},
+        {"ROT_PRIOR_NOISE_Z", std::to_string(ROT_PRIOR_NOISE_Z)},
+        {"TRANS_PRIOR_NOISE_X", std::to_string(TRANS_PRIOR_NOISE_X)},
+        {"TRANS_PRIOR_NOISE_Y", std::to_string(TRANS_PRIOR_NOISE_Y)},
+        {"TRANS_PRIOR_NOISE_Z", std::to_string(TRANS_PRIOR_NOISE_Z)},
+        {"GPS_NOISE_X", std::to_string(GPS_NOISE_X)},
+        {"GPS_NOISE_Y", std::to_string(GPS_NOISE_Y)},
+        {"GPS_NOISE_Z", std::to_string(GPS_NOISE_Z)},
+        {"ALT_PRIOR_NOISE", std::to_string(ALT_PRIOR_NOISE)}};
 
     INFO("Dynamic reconfigure updated VIO parameters.");
     WARN("Changing VIO State to RESET");
@@ -1791,22 +1864,24 @@ private:
     // Initial estimate for curr pose (curr key is new)
     gtsam::Pose3 currPoseGuess = prevPose.compose(relativePose);
 
-    // VO Between factor
+    // VO Between factor (per-axis noise)
     auto voNoise = gtsam::noiseModel::Diagonal::Sigmas(
-        (gtsam::Vector(6) << VO_NOISE_ROT, VO_NOISE_ROT, VO_NOISE_ROT,
-         VO_NOISE_TRANS, VO_NOISE_TRANS, VO_NOISE_TRANS)
+        (gtsam::Vector(6) << VO_NOISE_ROT_X, VO_NOISE_ROT_Y, VO_NOISE_ROT_Z,
+         VO_NOISE_TRANS_X, VO_NOISE_TRANS_Y, VO_NOISE_TRANS_Z)
             .finished());
     graph.add(gtsam::BetweenFactor<gtsam::Pose3>(prevSym, currSym, relativePose, voNoise));
 
-    // Orientation prior
+    // Orientation prior (per-axis noise)
     gtsam::Rot3 rotPrior(quat);
-    auto rotNoise = gtsam::noiseModel::Isotropic::Sigma(3, ROT_PRIOR_NOISE);
+    auto rotNoise = gtsam::noiseModel::Diagonal::Sigmas(
+        (gtsam::Vector(3) << ROT_PRIOR_NOISE_X, ROT_PRIOR_NOISE_Y, ROT_PRIOR_NOISE_Z).finished());
     graph.add(gtsam::PoseRotationPrior<gtsam::Pose3>(currSym, rotPrior, rotNoise));
 
-    // Velocity translation prior (full xyz)
+    // Velocity translation prior (per-axis noise)
     gtsam::Point3 expectedTrans = prevPose.translation() +
                                   gtsam::Point3(delta_translation.x(), delta_translation.y(), delta_translation.z());
-    auto transNoise = gtsam::noiseModel::Isotropic::Sigma(3, TRANS_PRIOR_NOISE);
+    auto transNoise = gtsam::noiseModel::Diagonal::Sigmas(
+        (gtsam::Vector(3) << TRANS_PRIOR_NOISE_X, TRANS_PRIOR_NOISE_Y, TRANS_PRIOR_NOISE_Z).finished());
     graph.add(gtsam::PoseTranslationPrior<gtsam::Pose3>(currSym, expectedTrans, transNoise));
 
     // Altitude prior (Z only): keep x/y from expectedTrans, constrain z
@@ -1821,7 +1896,7 @@ private:
     bool gpsUsed = false;
     Eigen::Vector3d gpsVec(0.0, 0.0, 0.0);
 
-    if (GPS_PRIOR_INTERVAL > 0 && (currKeyframe.index % GPS_PRIOR_INTERVAL == 0))
+    if (GPS_PRIOR_ENABLE && GPS_PRIOR_INTERVAL > 0 && (currKeyframe.index % GPS_PRIOR_INTERVAL == 0))
     {
       double minDiff = 1e9;
       ENU closestGps;
@@ -1860,11 +1935,15 @@ private:
         // auto gpsNoise = gtsam::noiseModel::Isotropic::Sigma(3, GPS_NOISE);
 
         auto gpsNoise = gtsam::noiseModel::Diagonal::Sigmas(
-            (gtsam::Vector(3) << GPS_NOISE, GPS_NOISE, GPS_NOISE).finished());
+            (gtsam::Vector(3) << GPS_NOISE_X, GPS_NOISE_Y, GPS_NOISE_Z).finished());
 
-        graph.add(gtsam::GPSFactor(currSym, gps_meas, gpsNoise));
+        graph.add(gtsam::PoseTranslationPrior<gtsam::Pose3>(
+            currSym,
+            gps_meas,
+            gpsNoise));
 
         OK("[GPS Factor] Added at keyframe " << currKeyframe.index
+
                                              << " (dt=" << minDiff << "s)");
       }
       else if (found)

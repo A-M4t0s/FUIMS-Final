@@ -442,8 +442,14 @@ class VIOResultsEvaluator:
       print(f"{'VIO PARAMETERS':^80}")
       print(f"{'='*80}{Colors.ENDC}\n")
       
-      # Define parameter categories
+      # Define parameter categories (matching vioParams.cfg structure)
       categories = {
+          'General VIO': [
+              'MAX_FEATURES', 'MIN_FEATURES', 'MIN_TRACKED_FEATURES',
+              'MAX_TRACKING_ERROR_PX', 'MAX_TRACKING_AGE',
+              'KF_FEATURE_THRESHOLD', 'KF_PARALLAX_THRESHOLD',
+              'GPS_PRIOR_INTERVAL', 'GPS_PRIOR_ENABLE'
+          ],
           'Feature Detection (GFTT)': [
               'GFTT_MAX_FEATURES', 'GFTT_QUALITY', 'GFTT_MIN_DIST', 'GFTT_BLOCK_SIZE'
           ],
@@ -451,19 +457,22 @@ class VIOResultsEvaluator:
               'KLT_MAX_LEVEL', 'KLT_ITERS', 'KLT_EPS', 'KLT_MIN_EIG', 
               'KLT_FB_THRESH_PX', 'KLT_BORDER_MARGIN'
           ],
-          'General VIO': [
-              'MAX_FEATURES', 'MIN_FEATURES', 'MIN_TRACKED_FEATURES',
-              'MAX_TRACKING_ERROR_PX', 'MAX_TRACKING_AGE'
+          'Information Rate': [
+              'CAMERA_RATE', 'INERTIAL_RATE'
           ],
-          'Keyframe Selection': [
-              'KF_FEATURE_THRESHOLD', 'KF_PARALLAX_THRESHOLD'
+          'VO Noise (per-axis)': [
+              'VO_NOISE_ROT_X', 'VO_NOISE_ROT_Y', 'VO_NOISE_ROT_Z',
+              'VO_NOISE_TRANS_X', 'VO_NOISE_TRANS_Y', 'VO_NOISE_TRANS_Z'
           ],
-          'Noise Models': [
-              'VO_NOISE_ROT', 'VO_NOISE_TRANS', 'ROT_PRIOR_NOISE', 
-              'TRANS_PRIOR_NOISE', 'ALT_PRIOR_NOISE', 'GPS_NOISE'
+          'Inertial Prior Noise (per-axis)': [
+              'ROT_PRIOR_NOISE_X', 'ROT_PRIOR_NOISE_Y', 'ROT_PRIOR_NOISE_Z',
+              'TRANS_PRIOR_NOISE_X', 'TRANS_PRIOR_NOISE_Y', 'TRANS_PRIOR_NOISE_Z'
           ],
-          'Sensor Configuration': [
-              'CAMERA_RATE', 'INERTIAL_RATE', 'GPS_PRIOR_INTERVAL'
+          'GPS Noise (per-axis)': [
+              'GPS_NOISE_X', 'GPS_NOISE_Y', 'GPS_NOISE_Z'
+          ],
+          'Altitude Prior Noise': [
+              'ALT_PRIOR_NOISE'
           ]
       }
       
