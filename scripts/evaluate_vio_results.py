@@ -209,8 +209,10 @@ class InteractiveTrajectoryViewer:
 class VIOResultsEvaluator:
     """Main evaluation class for VIO results."""
     
-    def __init__(self, results_dir: str = "/home/tony/Desktop/MEEC-SA/2º Ano/FUIMS/Resultados"):
+    def __init__(self, results_dir: str = "/home/tony/Desktop/MEEC-SA/2º Ano/FUIMS/Resultados",
+                 export_dir: str = "/home/tony/Desktop/MEEC-SA/2º Ano/FUIMS/Exports"):
         self.results_dir = results_dir
+        self.export_dir = export_dir
         self.csv_files = []
         self.current_file = None
         self.data = None
@@ -626,6 +628,380 @@ class VIOResultsEvaluator:
         plt.tight_layout()
         plt.show()
     
+    def display_multi_file_selector(self) -> List[str]:
+        """Display file selector for multiple file selection."""
+        clear_console()
+        files = self.list_results_files()
+        
+        if not files:
+            print(f"{Colors.FAIL}No results files found in {self.results_dir}{Colors.ENDC}")
+            input("Press Enter to continue...")
+            return []
+        
+        print(f"{Colors.HEADER}{Colors.BOLD}{'='*80}")
+        print(f"{'SELECT FILES FOR EXPORT':^80}")
+        print(f"{'='*80}{Colors.ENDC}\n")
+        
+        for i, file in enumerate(files, 1):
+            file_stat = os.stat(file)
+            file_size = file_stat.st_size / 1024  # KB
+            mod_time = datetime.fromtimestamp(file_stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            filename = os.path.basename(file)
+            print(f"{Colors.OKCYAN}{i:2d}{Colors.ENDC}. {filename:<50} {file_size:>8.1f} KB  {mod_time}")
+        
+        print(f"\n{Colors.OKBLUE}Selection formats:{Colors.ENDC}")
+        print(f"  • Range:      {Colors.OKCYAN}1-5{Colors.ENDC}       (files 1 through 5)")
+        print(f"  • Individual: {Colors.OKCYAN}1,3,5,7{Colors.ENDC}   (specific files)")
+        print(f"  • Mixed:      {Colors.OKCYAN}1-3,5,8-10{Colors.ENDC} (combination)")
+        print(f"  • All:        {Colors.OKCYAN}all{Colors.ENDC}       (all files)")
+        
+        print(f"\n{Colors.OKGREEN}Enter selection (or 'q' to cancel): {Colors.ENDC}", end="")
+        choice = input().strip().lower()
+        
+        if choice == 'q':
+            return []
+        
+        selected_indices = set()
+        
+        try:
+            if choice == 'all':
+                selected_indices = set(range(1, len(files) + 1))
+            else:
+                # Parse selection (supports ranges and individual numbers)
+                parts = choice.replace(' ', '').split(',')
+                for part in parts:
+                    if '-' in part:
+                        start, end = part.split('-')
+                        selected_indices.update(range(int(start), int(end) + 1))
+                    else:
+                        selected_indices.add(int(part))
+            
+            # Validate indices
+            valid_indices = [i for i in selected_indices if 1 <= i <= len(files)]
+            
+            if not valid_indices:
+                print(f"{Colors.FAIL}No valid files selected!{Colors.ENDC}")
+                input("Press Enter to continue...")
+                return []
+            
+            selected_files = [files[i - 1] for i in sorted(valid_indices)]
+            
+            print(f"\n{Colors.OKGREEN}Selected {len(selected_files)} file(s):{Colors.ENDC}")
+            for f in selected_files:
+                print(f"  • {os.path.basename(f)}")
+            
+            print(f"\n{Colors.OKGREEN}Proceed with export? (y/n): {Colors.ENDC}", end="")
+            confirm = input().strip().lower()
+            
+            if confirm == 'y':
+                return selected_files
+            return []
+            
+        except ValueError as e:
+            print(f"{Colors.FAIL}Invalid selection format: {e}{Colors.ENDC}")
+            input("Press Enter to continue...")
+            return []
+    
+    def _extract_file_data(self, filepath: str) -> Optional[Dict]:
+        """Extract parameters and compute metrics for a single file without loading into main state."""
+        try:
+            with open(filepath, 'r') as f:
+                content = f.read()
+            
+            lines = content.split('\n')
+            
+            # Parse parameters
+            parameters = {}
+            for line in lines:
+                if line.startswith('# ') and ':' in line:
+                    line_clean = line[2:].strip()
+                    if 'VIO PARAMETERS' not in line_clean and '====' not in line_clean and 'TRAJECTORY' not in line_clean:
+                        key, value = line_clean.split(':', 1)
+                        parameters[key.strip()] = value.strip()
+            
+            # Find section starts
+            est_start = None
+            gt_start = None
+            
+            for i, line in enumerate(lines):
+                if line.startswith('est_timestamp,'):
+                    est_start = i
+                elif line.startswith('gt_timestamp,'):
+                    gt_start = i
+            
+            if est_start is None or gt_start is None:
+                return None
+            
+            # Parse trajectories
+            est_data = []
+            for i in range(est_start + 1, len(lines)):
+                line = lines[i].strip()
+                if not line or line.startswith('#') or line.startswith('gt_timestamp'):
+                    break
+                parts = line.split(',')
+                if len(parts) == 4:
+                    est_data.append({
+                        'timestamp': float(parts[0]),
+                        'x': float(parts[1]),
+                        'y': float(parts[2]),
+                        'z': float(parts[3])
+                    })
+            
+            gt_data = []
+            for i in range(gt_start + 1, len(lines)):
+                line = lines[i].strip()
+                if not line or line.startswith('#'):
+                    break
+                parts = line.split(',')
+                if len(parts) == 4:
+                    gt_data.append({
+                        'timestamp': float(parts[0]),
+                        'x': float(parts[1]),
+                        'y': float(parts[2]),
+                        'z': float(parts[3])
+                    })
+            
+            # Associate trajectories
+            est_timestamps = np.array([d['timestamp'] for d in est_data])
+            gt_timestamps = np.array([d['timestamp'] for d in gt_data])
+            est_pos = np.array([[d['x'], d['y'], d['z']] for d in est_data])
+            gt_pos_all = np.array([[d['x'], d['y'], d['z']] for d in gt_data])
+            
+            associated_est = []
+            associated_gt = []
+            max_dt = 0.25
+            
+            for i, t_est in enumerate(est_timestamps):
+                dt_array = np.abs(gt_timestamps - t_est)
+                min_idx = np.argmin(dt_array)
+                if dt_array[min_idx] <= max_dt:
+                    associated_est.append(est_pos[i])
+                    associated_gt.append(gt_pos_all[min_idx])
+            
+            if len(associated_est) == 0:
+                return None
+            
+            associated_est = np.array(associated_est)
+            associated_gt = np.array(associated_gt)
+            
+            # Compute metrics
+            errors = np.linalg.norm(associated_est - associated_gt, axis=1)
+            
+            metrics = {
+                'ape_rmse': np.sqrt(np.mean(errors ** 2)),
+                'ape_max': np.max(errors),
+                'ape_min': np.min(errors),
+                'ape_mean': np.mean(errors),
+                'ape_std': np.std(errors),
+                'num_poses': len(errors),
+                'duration': est_timestamps[-1] - est_timestamps[0] if len(est_timestamps) > 1 else 0
+            }
+            
+            return {
+                'filename': os.path.basename(filepath),
+                'parameters': parameters,
+                'metrics': metrics,
+                'est_trajectory': {
+                    'timestamp': est_timestamps.tolist(),
+                    'x': est_pos[:, 0].tolist(),
+                    'y': est_pos[:, 1].tolist(),
+                    'z': est_pos[:, 2].tolist()
+                },
+                'gt_trajectory': {
+                    'timestamp': gt_timestamps.tolist(),
+                    'x': gt_pos_all[:, 0].tolist(),
+                    'y': gt_pos_all[:, 1].tolist(),
+                    'z': gt_pos_all[:, 2].tolist()
+                }
+            }
+            
+        except Exception as e:
+            print(f"{Colors.WARNING}Warning: Could not process {os.path.basename(filepath)}: {e}{Colors.ENDC}")
+            return None
+    
+    def export_consolidated_results(self):
+        """Export parameters and metrics from multiple files to a consolidated CSV."""
+        selected_files = self.display_multi_file_selector()
+        
+        if not selected_files:
+            return
+        
+        clear_console()
+        print(f"{Colors.HEADER}{Colors.BOLD}{'='*80}")
+        print(f"{'EXPORTING CONSOLIDATED RESULTS':^80}")
+        print(f"{'='*80}{Colors.ENDC}\n")
+        
+        # Process all selected files
+        all_data = []
+        for i, filepath in enumerate(selected_files, 1):
+            print(f"Processing [{i}/{len(selected_files)}]: {os.path.basename(filepath)}...", end=" ")
+            file_data = self._extract_file_data(filepath)
+            if file_data:
+                all_data.append(file_data)
+                print(f"{Colors.OKGREEN}✓{Colors.ENDC}")
+            else:
+                print(f"{Colors.FAIL}✗{Colors.ENDC}")
+        
+        if not all_data:
+            print(f"\n{Colors.FAIL}No valid data extracted from selected files.{Colors.ENDC}")
+            input("Press Enter to continue...")
+            return
+        
+        # Collect all unique parameter keys
+        all_param_keys = set()
+        for data in all_data:
+            all_param_keys.update(data['parameters'].keys())
+        all_param_keys = sorted(all_param_keys)
+        
+        # Metric keys
+        metric_keys = ['ape_rmse', 'ape_max', 'ape_min', 'ape_mean', 'ape_std', 'num_poses', 'duration']
+        
+        # Create export directory if needed
+        os.makedirs(self.export_dir, exist_ok=True)
+        
+        # Generate output filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"vio_comparison_{timestamp}.csv"
+        output_path = os.path.join(self.export_dir, output_filename)
+        
+        # Write CSV
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            
+            # Section 1: Parameters and Metrics comparison table
+            writer.writerow(['# ===== PARAMETERS AND METRICS ====='])
+            writer.writerow([])
+            
+            # Header
+            header = ['filename'] + all_param_keys + metric_keys
+            writer.writerow(header)
+            
+            # Data rows
+            for data in all_data:
+                row = [data['filename']]
+                
+                # Parameters
+                for key in all_param_keys:
+                    row.append(data['parameters'].get(key, ''))
+                
+                # Metrics
+                for key in metric_keys:
+                    value = data['metrics'].get(key, '')
+                    if isinstance(value, float):
+                        row.append(f"{value:.6f}")
+                    else:
+                        row.append(str(value))
+                
+                writer.writerow(row)
+            
+            # Section 2: Ground Truth Trajectory (only once, from first file)
+            writer.writerow([])
+            writer.writerow(['# ===== GROUND TRUTH TRAJECTORY ====='])
+            writer.writerow([])
+            writer.writerow(['gt_timestamp', 'gt_x', 'gt_y', 'gt_z'])
+            
+            gt_traj = all_data[0]['gt_trajectory']
+            for i in range(len(gt_traj['timestamp'])):
+                writer.writerow([
+                    f"{gt_traj['timestamp'][i]:.6f}",
+                    f"{gt_traj['x'][i]:.6f}",
+                    f"{gt_traj['y'][i]:.6f}",
+                    f"{gt_traj['z'][i]:.6f}"
+                ])
+            
+            # Section 3: Estimated Trajectories (one section per file)
+            for data in all_data:
+                writer.writerow([])
+                writer.writerow([f"# ===== ESTIMATED TRAJECTORY: {data['filename']} ====="])
+                writer.writerow([])
+                writer.writerow(['est_timestamp', 'est_x', 'est_y', 'est_z'])
+                
+                est_traj = data['est_trajectory']
+                for i in range(len(est_traj['timestamp'])):
+                    writer.writerow([
+                        f"{est_traj['timestamp'][i]:.6f}",
+                        f"{est_traj['x'][i]:.6f}",
+                        f"{est_traj['y'][i]:.6f}",
+                        f"{est_traj['z'][i]:.6f}"
+                    ])
+        
+        print(f"\n{Colors.OKGREEN}{'='*80}")
+        print(f"EXPORT COMPLETE")
+        print(f"{'='*80}{Colors.ENDC}")
+        print(f"\n  {Colors.OKCYAN}Files processed:{Colors.ENDC} {len(all_data)}")
+        print(f"  {Colors.OKCYAN}Parameters:{Colors.ENDC}       {len(all_param_keys)}")
+        print(f"  {Colors.OKCYAN}Metrics:{Colors.ENDC}          {len(metric_keys)}")
+        print(f"\n  {Colors.OKGREEN}Output file:{Colors.ENDC}")
+        print(f"  {output_path}")
+        
+        # Also create a summary TXT file
+        txt_filename = f"vio_comparison_{timestamp}_summary.txt"
+        txt_path = os.path.join(self.export_dir, txt_filename)
+        
+        with open(txt_path, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"VIO RESULTS COMPARISON SUMMARY\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 80 + "\n\n")
+            
+            f.write(f"Files analyzed: {len(all_data)}\n\n")
+            
+            # Best/worst metrics summary
+            rmse_values = [d['metrics']['ape_rmse'] for d in all_data]
+            best_idx = np.argmin(rmse_values)
+            worst_idx = np.argmax(rmse_values)
+            
+            f.write("-" * 80 + "\n")
+            f.write("BEST RESULT (Lowest RMSE)\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"  File: {all_data[best_idx]['filename']}\n")
+            f.write(f"  RMSE: {all_data[best_idx]['metrics']['ape_rmse']:.4f} m\n")
+            f.write(f"  MAX:  {all_data[best_idx]['metrics']['ape_max']:.4f} m\n")
+            f.write(f"  MEAN: {all_data[best_idx]['metrics']['ape_mean']:.4f} m\n\n")
+            
+            f.write("-" * 80 + "\n")
+            f.write("WORST RESULT (Highest RMSE)\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"  File: {all_data[worst_idx]['filename']}\n")
+            f.write(f"  RMSE: {all_data[worst_idx]['metrics']['ape_rmse']:.4f} m\n")
+            f.write(f"  MAX:  {all_data[worst_idx]['metrics']['ape_max']:.4f} m\n")
+            f.write(f"  MEAN: {all_data[worst_idx]['metrics']['ape_mean']:.4f} m\n\n")
+            
+            f.write("-" * 80 + "\n")
+            f.write("ALL RESULTS RANKING (by RMSE)\n")
+            f.write("-" * 80 + "\n")
+            
+            # Sort by RMSE
+            sorted_data = sorted(all_data, key=lambda x: x['metrics']['ape_rmse'])
+            for i, data in enumerate(sorted_data, 1):
+                f.write(f"  {i:2d}. {data['filename']:<50} RMSE: {data['metrics']['ape_rmse']:.4f} m\n")
+            
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("DETAILED RESULTS\n")
+            f.write("=" * 80 + "\n\n")
+            
+            for data in sorted_data:
+                f.write(f"\n{'─' * 80}\n")
+                f.write(f"FILE: {data['filename']}\n")
+                f.write(f"{'─' * 80}\n")
+                
+                f.write("\nMETRICS:\n")
+                for key in metric_keys:
+                    value = data['metrics'].get(key, 'N/A')
+                    if isinstance(value, float):
+                        f.write(f"  {key:<15}: {value:.6f}\n")
+                    else:
+                        f.write(f"  {key:<15}: {value}\n")
+                
+                f.write("\nPARAMETERS:\n")
+                for key in sorted(data['parameters'].keys()):
+                    f.write(f"  {key:<30}: {data['parameters'][key]}\n")
+        
+        print(f"\n  {Colors.OKGREEN}Summary file:{Colors.ENDC}")
+        print(f"  {txt_path}")
+        
+        input("\nPress Enter to continue...")
+    
     def run_interactive_session(self):
         """Run interactive evaluation session."""
         while True:
@@ -644,6 +1020,7 @@ class VIOResultsEvaluator:
             print(f"  {Colors.OKCYAN}4{Colors.ENDC} - Interactive trajectory viewer (GUI)")
             print(f"  {Colors.OKCYAN}5{Colors.ENDC} - Plot 3D trajectory")
             print(f"  {Colors.OKCYAN}6{Colors.ENDC} - Plot XYZ comparison")
+            print(f"  {Colors.OKCYAN}7{Colors.ENDC} - Export consolidated results (multi-file)")
             print(f"  {Colors.OKCYAN}q{Colors.ENDC} - Quit")
             
             print(f"\n{Colors.OKGREEN}Enter choice: {Colors.ENDC}", end="")
@@ -663,6 +1040,8 @@ class VIOResultsEvaluator:
                 self.plot_trajectory_3d()
             elif choice == '6':
                 self.plot_xyz_comparison()
+            elif choice == '7':
+                self.export_consolidated_results()
             elif choice == 'q':
                 clear_console()
                 print(f"{Colors.OKGREEN}Goodbye!{Colors.ENDC}")
@@ -677,9 +1056,12 @@ def main():
     parser.add_argument('--results-dir', 
                        default="/home/tony/Desktop/MEEC-SA/2º Ano/FUIMS/Resultados",
                        help='Path to results directory')
+    parser.add_argument('--export-dir',
+                       default="/home/tony/Desktop/MEEC-SA/2º Ano/FUIMS/Exports",
+                       help='Path to export directory for consolidated results')
     args = parser.parse_args()
     
-    evaluator = VIOResultsEvaluator(args.results_dir)
+    evaluator = VIOResultsEvaluator(args.results_dir, args.export_dir)
     evaluator.run_interactive_session()
 
 if __name__ == '__main__':
